@@ -21,8 +21,8 @@ Key Architecture:
    - `self.unrealized_profit` resets to 0.0.
    - The 1% Risk Manager dynamically calculates risk using the live compounding `self.account_balance`.
 3. Day-Lock Penalty for Stop-Loss:
-   - If the -1% stop-loss triggers, the trade is squared off, balance is compounded, severe penalty
-     is applied, and `self.locked_out_for_day = True` is set.
+   - If the -1% stop-loss triggers, the trade is squared off, balance is compounded, flat penalty
+     of -10.0 is applied, and `self.locked_out_for_day = True` is set.
    - While `locked_out_for_day` is True, all actions are overridden to 0.0 (Hold).
    - `self.locked_out_for_day = False` and `self.daily_trades_count = 0` reset when the date rolls over.
 4. 15:15 MIS Auto-Square-Off:
@@ -30,7 +30,7 @@ Key Architecture:
      is permanently compounded into `self.account_balance`, and the agent remains flat until the
      next morning session (09:15:00) with `terminated = False` and `truncated = False`.
 5. Round-Trip Brokerage & STT Transaction Costs:
-   - `self.commission_rate = 0.0005` (0.05% brokerage, turnover charges, and STT).
+   - `self.commission_rate = 0.0003` (0.03% brokerage, turnover charges, and STT).
    - Deducted twice per full trade lifecycle (entry leg and exit leg).
    - All deductions are tracked in `self.total_fees_paid`.
 """
@@ -61,7 +61,7 @@ class ConstrainedTradingEnv(gym.Env):
     - Sizing: Scaled by Risk Manager up to max 1.0% (0.01) risk of live `account_balance`.
     """
 
-    metadata = {"render_modes": ["human"], "version": "3.2.0"}
+    metadata = {"render_modes": ["human"], "version": "3.3.0"}
 
     def __init__(
         self,
@@ -70,7 +70,7 @@ class ConstrainedTradingEnv(gym.Env):
         max_risk_per_trade: float = 0.01,
         profit_target: float = 0.02,
         loss_limit: float = -0.01,
-        commission_rate: float = 0.0005,
+        commission_rate: float = 0.0003,
         max_daily_trades: int = 3,
         auto_square_off_time: time = time(15, 15, 0),
         price_col: str = "Close",
@@ -82,9 +82,9 @@ class ConstrainedTradingEnv(gym.Env):
             df: DataFrame containing normalized OHLCV, indicators, and sentiment with DatetimeIndex.
             initial_balance: Starting account equity in currency units (default: 100,000.0).
             max_risk_per_trade: Maximum allowable fraction of account equity risked on a trade (0.01 = 1%).
-            profit_target: Target profit fraction triggering +10 reward and reset (0.02 = 2%).
+            profit_target: Target profit fraction triggering +20 reward and reset (0.02 = 2%).
             loss_limit: Stop-loss threshold triggering day-lock (-0.01 = -1%).
-            commission_rate: Transaction fee fraction per single leg (0.0005 = 0.05%).
+            commission_rate: Transaction fee fraction per single leg (0.0003 = 0.03%).
             max_daily_trades: Maximum permitted trade entries per calendar day (default: 3).
             auto_square_off_time: Cut-off time for MIS intraday square-off (default: 15:15:00).
             price_col: Column name to use for computing step returns (default: 'Close').
@@ -199,7 +199,7 @@ class ConstrainedTradingEnv(gym.Env):
 
     def _deduct_leg_fee(self) -> float:
         """
-        Helper method to apply single-leg commission fee (0.05% of live account balance).
+        Helper method to apply single-leg commission fee (0.03% of live account balance).
         Deducts fee from open trade unrealized profit and tracks in total_fees_paid.
 
         Returns:
@@ -307,7 +307,7 @@ class ConstrainedTradingEnv(gym.Env):
             if net_fraction > 0.0:
                 step_reward += float(net_fraction * 10.0)
             else:
-                step_reward += float(net_fraction * 20.0)
+                step_reward += float(net_fraction * 10.0)
 
         # 3. Parse and Filter Raw Action
         act_val = float(action[0]) if isinstance(action, (np.ndarray, list)) else float(action)
@@ -332,10 +332,9 @@ class ConstrainedTradingEnv(gym.Env):
             else:
                 # Attempting to open a new position
                 if self.daily_trades_count >= self.max_daily_trades:
-                    # 3-Trade daily cap exceeded: Force Hold and apply penalty
+                    # 3-Trade daily cap reached: Force Hold without artificial micro-penalty
                     effective_action = 0.0
                     act_val = 0.0
-                    step_reward -= 0.1
                 else:
                     # Open new position
                     self.daily_trades_count += 1
@@ -355,11 +354,11 @@ class ConstrainedTradingEnv(gym.Env):
                 trade_closed_profit = bool(net_fraction > 0.0)
 
                 if net_fraction >= self.profit_target:
-                    close_reward = 10.0
+                    close_reward = 20.0
                 elif net_fraction > 0.0:
                     close_reward = net_fraction * 10.0
                 else:
-                    close_reward = net_fraction * 20.0
+                    close_reward = net_fraction * 10.0
 
                 effective_action = 0.0
                 step_reward += close_reward
@@ -374,11 +373,11 @@ class ConstrainedTradingEnv(gym.Env):
                 trade_closed_profit = bool(net_fraction > 0.0)
 
                 if net_fraction >= self.profit_target:
-                    close_reward = 10.0
+                    close_reward = 20.0
                 elif net_fraction > 0.0:
                     close_reward = net_fraction * 10.0
                 else:
-                    close_reward = net_fraction * 20.0
+                    close_reward = net_fraction * 10.0
 
                 step_reward += close_reward
 
@@ -390,7 +389,6 @@ class ConstrainedTradingEnv(gym.Env):
                 ):
                     effective_action = 0.0
                     act_val = 0.0
-                    step_reward -= 0.1
                 else:
                     self.daily_trades_count += 1
                     self.total_trades += 1
@@ -423,11 +421,9 @@ class ConstrainedTradingEnv(gym.Env):
         next_time = self.dates[self.current_step].time()
 
         if self.is_active_position:
-            # Trigger A: Strict -1% Stop-Loss with Day-Lock Penalty (NEVER terminates episode)
+            # Trigger A: Strict -1% Stop-Loss with Day-Lock Penalty (Flat -10.0 penalty)
             if self.unrealized_profit <= self.loss_limit:
-                # Calculate penalty including slippage past -1% limit
-                stop_loss_penalty = -10.0 - (abs(self.unrealized_profit) * 100.0)
-                step_reward += stop_loss_penalty
+                step_reward -= 10.0
 
                 # Square off trade, deduct exit fee, and compound balance
                 self._close_position_and_compound()
@@ -443,20 +439,20 @@ class ConstrainedTradingEnv(gym.Env):
                 if net_fraction > 0.0:
                     step_reward += float(net_fraction * 10.0)
                 else:
-                    step_reward += float(net_fraction * 20.0)
+                    step_reward += float(net_fraction * 10.0)
 
-            # Trigger C: Continuous Profit Taking (+2% target hit)
+            # Trigger C: Continuous Profit Taking (+2% target hit with 1:2 risk-reward reward)
             elif self.unrealized_profit >= self.profit_target:
                 self._close_position_and_compound()
-                step_reward += 10.0
+                step_reward += 20.0
                 trade_closed_profit = True
 
             else:
-                # Ongoing step holding reward
+                # Ongoing step holding reward (Symmetric)
                 if step_profit > 0.0:
                     step_reward += float(step_profit * 10.0)
                 else:
-                    step_reward += float(step_profit * 20.0)
+                    step_reward += float(step_profit * 10.0)  # step_profit is already negative, naturally subtracts symmetrically
 
         # 7. Unbroken Continuous Episode: ONLY terminate at absolute end of dataset
         terminated = False

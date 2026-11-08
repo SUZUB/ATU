@@ -38,7 +38,7 @@ def create_trading_env(
     max_risk_per_trade: float = 0.01,
     profit_target: float = 0.02,
     loss_limit: float = -0.01,
-    commission_rate: float = 0.0005,
+    commission_rate: float = 0.0003,
     max_daily_trades: int = 3,
 ) -> ConstrainedTradingEnv:
     """
