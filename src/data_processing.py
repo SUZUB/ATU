@@ -340,37 +340,70 @@ class SentimentProcessor:
 # Archive Data Loader & Intraday Market Generator
 # =====================================================================
 def load_archive_headlines(
-    archive_dir: Union[str, Path] = "archive",
+    archive_dir: Optional[Union[str, Path]] = None,
     ticker: Optional[str] = None,
     max_rows: int = 1000,
 ) -> pd.DataFrame:
     """
-    Loads real headlines from local archive directory (analyst_ratings_processed.csv
-    or raw_partner_headlines.csv). Filters by ticker if provided.
+    Loads real headlines from local archive directory or Google Drive dataset storage.
+    Searches candidate directories:
+      1. Provided archive_dir
+      2. /content/drive/MyDrive/ATU_Data (Google Colab persistent Drive storage)
+      3. archive/ (Local workspace)
+    Checks:
+      - analyst_ratings_processed.csv
+      - raw_analyst_ratings.csv
+      - raw_partner_headlines.csv
 
     Returns:
         pd.DataFrame: Formatted with columns ['date', 'headline'].
     """
-    archive_path = Path(archive_dir)
-    file_candidate = archive_path / "analyst_ratings_processed.csv"
-    fallback_candidate = archive_path / "raw_partner_headlines.csv"
+    candidate_dirs = []
+    if archive_dir is not None:
+        candidate_dirs.append(Path(archive_dir))
+    candidate_dirs.extend([
+        Path("/content/drive/MyDrive/ATU_Data"),
+        Path("archive"),
+        Path("../archive"),
+    ])
 
-    if file_candidate.exists():
-        df = pd.read_csv(file_candidate, nrows=max_rows * 5)
-        # Columns: title, date, stock
-        if ticker is not None and "stock" in df.columns:
-            df = df[df["stock"].str.upper() == ticker.upper()]
-        df = df.rename(columns={"title": "headline"}).dropna(subset=["headline", "date"])
-        df = df[["date", "headline"]].head(max_rows)
-        return df
+    file_names = [
+        "analyst_ratings_processed.csv",
+        "raw_analyst_ratings.csv",
+        "raw_partner_headlines.csv",
+    ]
 
-    elif fallback_candidate.exists():
-        df = pd.read_csv(fallback_candidate, nrows=max_rows * 5)
-        if ticker is not None and "stock" in df.columns:
-            df = df[df["stock"].str.upper() == ticker.upper()]
-        df = df.dropna(subset=["headline", "date"])
-        df = df[["date", "headline"]].head(max_rows)
-        return df
+    target_file = None
+    for c_dir in candidate_dirs:
+        for f_name in file_names:
+            candidate = c_dir / f_name
+            if candidate.exists():
+                target_file = candidate
+                break
+        if target_file is not None:
+            break
+
+    if target_file is not None:
+        try:
+            df = pd.read_csv(target_file, nrows=max_rows * 5)
+            # Normalize title/headline column name
+            if "title" in df.columns and "headline" not in df.columns:
+                df = df.rename(columns={"title": "headline"})
+
+            # Filter by ticker if available
+            stock_col = next((c for c in df.columns if c.lower() in ["stock", "ticker"]), None)
+            if ticker is not None and stock_col is not None:
+                df = df[df[stock_col].astype(str).str.upper() == ticker.upper()]
+
+            df = df.dropna(subset=["headline", "date"])
+
+            # Clean and normalize date to YYYY-MM-DD
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
+            df = df.dropna(subset=["date"])
+            df = df[["date", "headline"]].head(max_rows)
+            return df
+        except Exception as e:
+            print(f"Warning: Failed to parse archive headlines from {target_file}: {e}")
 
     # Mock fallback if archive is absent
     return pd.DataFrame(

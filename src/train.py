@@ -1,34 +1,33 @@
 """
 src/train.py
 ============
-Main Execution Pipeline for the RL Trading System.
+Modular Execution Pipeline for the ATU Reinforcement Learning Trading System.
 
-Data Flow & Lifecycle:
-----------------------
-1. Ingestion & Indicators (File 1):
-   - MarketDataProcessor computes OHLCV + Technical Indicators (RSI, MACD, ATR, BB, ADX).
-2. Sentiment Scoring (File 2):
-   - SentimentProcessor scores financial news headlines via ProsusAI/finbert.
-3. Feature Merging:
-   - Merges both feature streams into one massive table: `final_state_vector`.
-4. Train/Test Chronological Split:
-   - 80% Training Set, 20% Out-of-Sample Testing Set.
-5. RL Environment (File 3):
-   - ConstrainedTradingEnv enforces continuous compounding, 15:15 MIS auto-square-off,
-     day-lock stop-loss penalty, 3-trade daily cap, and round-trip transaction fees.
-6. Training & Continuous Backtesting:
-   - Trains PPO for 200,000 steps via Stable-Baselines3.
-   - Saves model to disk (`ppo_trading_agent_v1.zip`).
-   - Backtests on the remaining 20% test set using an unbroken continuous loop.
-   - Outputs institutional-grade financial audit metrics (Sortino, Gross vs. Net PnL, Fees).
+Sequential Data Flow:
+---------------------
+1. File 1 (MarketDataProcessor) computes OHLCV + Technical Indicators (RSI, MACD, ATR, BB, ADX).
+2. File 2 (SentimentProcessor) scores financial headlines via ProsusAI/finbert (CUDA/CPU).
+3. Merges feature streams into unified `final_state_vector`.
+4. Chronological 80% Train / 20% Test Split (no lookahead bias).
+5. Vectorizes File 3 (`ConstrainedTradingEnv`) via `DummyVecEnv`.
+6. Trains PPO agent with periodic checkpoints.
+7. Saves artifacts to Google Drive or local storage in organized subdirectories:
+   - checkpoints/
+   - final_models/
+   - training_logs/
+   - backtest_results/
+   - evaluation_metrics/
+8. Continuous walk-forward backtesting loop auditing Sortino, Sharpe, Max Drawdown, and Fees.
 """
 
+import json
 from pathlib import Path
 import sys
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 # Package imports
@@ -40,9 +39,8 @@ try:
         generate_intraday_5min_market_data,
         load_archive_headlines,
     )
-    from src.model import ConstrainedTradingEnv, create_vectorized_env
+    from src.model import ConstrainedTradingEnv, create_vectorized_env, create_ppo_agent
 except ImportError:
-    # Support direct script execution
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from src.data_processing import (
         MarketDataProcessor,
@@ -51,40 +49,64 @@ except ImportError:
         generate_intraday_5min_market_data,
         load_archive_headlines,
     )
-    from src.model import ConstrainedTradingEnv, create_vectorized_env
+    from src.model import ConstrainedTradingEnv, create_vectorized_env, create_ppo_agent
 
 
-def calculate_sortino_ratio(
-    returns: Union[List[float], np.ndarray],
-    risk_free_rate: float = 0.0,
-    target_return: float = 0.0,
-    periods_per_year: int = 252,
-) -> float:
+def calculate_financial_metrics(
+    portfolio_values: List[float],
+    step_returns: List[float],
+    total_trades: int,
+    profitable_trades: int,
+    initial_balance: float,
+    final_balance: float,
+    total_fees_paid: float,
+    bars_per_day: int = 75,
+) -> Dict[str, Any]:
     """
-    Calculates the annualized Sortino Ratio:
-    Sortino Ratio = (Annualized Mean Return - Risk-Free Rate) / Annualized Downside Deviation
+    Computes institutional risk-adjusted return and drawdown metrics.
     """
-    returns_arr = np.asarray(returns, dtype=np.float64)
-    if len(returns_arr) == 0:
-        return 0.0
+    pv_arr = np.asarray(portfolio_values, dtype=np.float64)
+    ret_arr = np.asarray(step_returns, dtype=np.float64)
+    annual_factor = np.sqrt(252 * bars_per_day)
 
-    mean_return = float(np.mean(returns_arr))
-    annualized_return = mean_return * periods_per_year
+    net_profit = final_balance - initial_balance
+    net_return_pct = (net_profit / initial_balance) * 100.0
+    gross_profit = net_profit + total_fees_paid
+    gross_return_pct = (gross_profit / initial_balance) * 100.0
 
-    downside_diff = returns_arr - target_return
-    downside_returns = np.minimum(0.0, downside_diff)
-    downside_variance = np.mean(np.square(downside_returns))
-    downside_deviation = np.sqrt(downside_variance) * np.sqrt(periods_per_year)
+    if len(pv_arr) > 0:
+        peak = np.maximum.accumulate(pv_arr)
+        drawdown = (pv_arr - peak) / np.maximum(peak, 1e-9)
+        max_drawdown_pct = float(np.min(drawdown)) * 100.0
+    else:
+        max_drawdown_pct = 0.0
 
-    if downside_deviation < 1e-9:
-        if annualized_return > risk_free_rate:
-            return float(np.inf)
-        elif annualized_return < risk_free_rate:
-            return float(-np.inf)
-        else:
-            return 0.0
+    mean_ret = float(np.mean(ret_arr)) if len(ret_arr) > 0 else 0.0
+    std_ret = float(np.std(ret_arr)) if len(ret_arr) > 0 else 0.0
+    sharpe = float((mean_ret / std_ret) * annual_factor) if std_ret > 1e-9 else 0.0
 
-    return float((annualized_return - risk_free_rate) / downside_deviation)
+    downside_returns = np.minimum(0.0, ret_arr)
+    downside_variance = np.mean(np.square(downside_returns)) if len(ret_arr) > 0 else 0.0
+    downside_dev = np.sqrt(downside_variance)
+    sortino = float((mean_ret / downside_dev) * annual_factor) if downside_dev > 1e-9 else 0.0
+
+    win_rate = (profitable_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+
+    return {
+        "initial_balance": float(initial_balance),
+        "final_balance": float(final_balance),
+        "net_profit": float(net_profit),
+        "net_return_pct": float(net_return_pct),
+        "gross_profit": float(gross_profit),
+        "gross_return_pct": float(gross_return_pct),
+        "total_fees_paid": float(total_fees_paid),
+        "total_trades": int(total_trades),
+        "profitable_trades": int(profitable_trades),
+        "win_rate_pct": float(win_rate),
+        "max_drawdown_pct": float(max_drawdown_pct),
+        "sharpe_ratio": float(sharpe),
+        "sortino_ratio": float(sortino),
+    }
 
 
 def build_pipeline_data(
@@ -93,22 +115,10 @@ def build_pipeline_data(
     use_finbert: bool = False,
     n_candles: int = 1500,
     device: str = "auto",
+    data_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Executes the sequential data pipeline:
-    File 1 (MarketDataProcessor) + File 2 (SentimentProcessor) -> final_state_vector.
-
-    Args:
-        ticker: Target asset symbol.
-        use_live_market_data: If True, fetches live 5-minute data from Yahoo Finance.
-                              If False, synthesizes realistic 5-min intraday market data.
-        use_finbert: If True, executes FinBERT model inference on news headlines.
-                     If False, uses fast cached/scored headline sentiments.
-        n_candles: Total number of 5-minute bars to generate if simulating.
-        device: Compute device ('auto', 'cuda', 'cpu').
-
-    Returns:
-        pd.DataFrame: Merged `final_state_vector` DataFrame.
+    Executes File 1 + File 2 and produces `final_state_vector`.
     """
     print("[Pipeline Step 1] Fetching & Engineering Market Data (File 1)...")
     market_processor = MarketDataProcessor()
@@ -129,7 +139,7 @@ def build_pipeline_data(
     print(f"  - Market Features Engineered: {market_state_df.shape[0]} rows, {market_state_df.shape[1]} columns")
 
     print("\n[Pipeline Step 2] Scoring News Sentiment via FinBERT (File 2)...")
-    headlines_df = load_archive_headlines(archive_dir="archive", ticker=ticker, max_rows=500)
+    headlines_df = load_archive_headlines(archive_dir=data_dir, ticker=ticker, max_rows=500)
     sentiment_df: Optional[pd.DataFrame] = None
 
     if use_finbert and not headlines_df.empty:
@@ -144,7 +154,6 @@ def build_pipeline_data(
             sentiment_df = None
 
     if sentiment_df is None or sentiment_df.empty:
-        # Create realistic sentiment stream matching market dates
         unique_dates = sorted(list(set(pd.to_datetime(market_state_df.index).strftime("%Y-%m-%d"))))
         rng = np.random.default_rng(42)
         sentiment_df = pd.DataFrame(
@@ -169,16 +178,11 @@ def run_pipeline(
     use_finbert: bool = False,
     model_save_path: str = "ppo_trading_agent_v1",
     device: str = "auto",
+    data_dir: Optional[str] = None,
+    checkpoint_freq: Optional[int] = None,
 ) -> Tuple[PPO, float, float, float]:
     """
-    Executes the complete Sequential Data Pipeline:
-    1. Runs File 1 & File 2 to build `final_state_vector`.
-    2. Splits data into 80% Train and 20% Test chronologically.
-    3. Feeds training data into File 3 (`ConstrainedTradingEnv`) via `DummyVecEnv`.
-    4. Trains PPO agent for 200,000 steps.
-    5. Saves trained model to disk.
-    6. Executes continuous backtesting loop on remaining 20% test set.
-    7. Logs comprehensive financial performance report.
+    Executes the complete Sequential Data Pipeline.
     """
     print("=" * 70)
     print("     REINFORCEMENT LEARNING INTRADAY TRADING PIPELINE (PPO)     ")
@@ -191,6 +195,7 @@ def run_pipeline(
         use_finbert=use_finbert,
         n_candles=1500,
         device=device,
+        data_dir=data_dir,
     )
 
     # 2. Chronological 80% Train / 20% Test Split
@@ -211,10 +216,39 @@ def run_pipeline(
     print(f"  - Action Space:      {train_env.action_space}")
     print(f"  - Observation Space: {train_env.observation_space}")
 
+    # Setup directories
+    base_output_dir = Path(model_save_path)
+    if base_output_dir.suffix:
+        base_dir = base_output_dir.parent if base_output_dir.parent != Path("") else Path(".")
+        model_name = base_output_dir.stem
+    else:
+        base_dir = base_output_dir
+        model_name = "ppo_trading_agent_v1"
+
+    checkpoints_dir = base_dir / "checkpoints"
+    final_models_dir = base_dir / "final_models"
+    training_logs_dir = base_dir / "training_logs"
+    backtest_results_dir = base_dir / "backtest_results"
+    evaluation_metrics_dir = base_dir / "evaluation_metrics"
+
+    for d in [checkpoints_dir, final_models_dir, training_logs_dir, backtest_results_dir, evaluation_metrics_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    callbacks = []
+    freq = checkpoint_freq if checkpoint_freq else max(1000, total_timesteps // 5)
+    callbacks.append(
+        CheckpointCallback(
+            save_freq=freq,
+            save_path=str(checkpoints_dir),
+            name_prefix="ppo_checkpoint",
+            save_replay_buffer=False,
+            save_vecnormalize=True,
+        )
+    )
+
     # 4. Model Training
     print(f"\n[Pipeline Step 6] Initializing PPO (Device: {device}) & Training for {total_timesteps:,} Timesteps...")
-    model = PPO(
-        policy="MlpPolicy",
+    model = create_ppo_agent(
         env=train_env,
         learning_rate=0.0003,
         n_steps=2048,
@@ -228,20 +262,36 @@ def run_pipeline(
         device=device,
     )
 
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, callback=callbacks)
 
     # 5. Persist Model
-    save_path_obj = Path(model_save_path)
-    if save_path_obj.parent and not save_path_obj.parent.exists():
-        save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    final_zip_path = final_models_dir / f"{model_name}.zip"
+    compat_zip_path = base_dir / f"{model_name}.zip"
 
-    print(f"\n[Pipeline Step 7] Saving Model to '{model_save_path}'...")
-    model.save(model_save_path)
-    print("  - Model weights successfully saved.")
+    print(f"\n[Pipeline Step 7] Saving Model to:")
+    print(f"  - Primary:       {final_zip_path}")
+    print(f"  - Compatibility: {compat_zip_path}")
+    model.save(str(final_zip_path.with_suffix("")))
+    model.save(str(compat_zip_path.with_suffix("")))
+
+    train_config = {
+        "ticker": ticker,
+        "total_timesteps": total_timesteps,
+        "device": device,
+        "use_live_market_data": use_live_market_data,
+        "use_finbert": use_finbert,
+        "train_candles": len(train_df),
+        "test_candles": len(test_df),
+        "learning_rate": 0.0003,
+        "batch_size": 64,
+        "gamma": 0.99,
+    }
+    with open(training_logs_dir / "training_config.json", "w", encoding="utf-8") as f:
+        json.dump(train_config, f, indent=2)
 
     # 6. Continuous Walk-Forward Backtesting Loop on Remaining 20% Test Data
     print("\n[Pipeline Step 8] Running Continuous Backtesting Loop on 20% Test Data...")
-    loaded_model = PPO.load(model_save_path, device=device)
+    loaded_model = PPO.load(str(final_zip_path), device=device)
     test_env = ConstrainedTradingEnv(df=test_df)
     state, info = test_env.reset(seed=42)
 
@@ -270,36 +320,70 @@ def run_pipeline(
     total_trades_executed = step_info.get("total_trades", 0)
     total_fees_paid = step_info.get("total_fees_paid", 0.0)
 
-    net_profit = final_compounded_balance - initial_balance
-    net_return_pct = (net_profit / initial_balance) * 100.0
-    gross_profit = net_profit + total_fees_paid
-    gross_return_pct = (gross_profit / initial_balance) * 100.0
-
     # 7. Financial Performance Audit Report
-    print("\n[Pipeline Step 9] Calculating Sortino Ratio & Audit Metrics...")
-    sortino = calculate_sortino_ratio(
-        returns=step_returns,
-        risk_free_rate=0.0,
-        target_return=0.0,
-        periods_per_year=252,
+    print("\n[Pipeline Step 9] Calculating Institutional Audit Metrics...")
+    metrics = calculate_financial_metrics(
+        portfolio_values=portfolio_values,
+        step_returns=step_returns,
+        total_trades=total_trades_executed,
+        profitable_trades=profitable_closed_trades,
+        initial_balance=initial_balance,
+        final_balance=final_compounded_balance,
+        total_fees_paid=total_fees_paid,
     )
+    metrics["total_days_processed"] = total_days_processed
+    metrics["total_steps"] = step_count
+    metrics["continuous_episode_completed"] = bool(terminated)
 
-    print("\n" + "=" * 70)
-    print("             INTRADAY BACKTEST PERFORMANCE REPORT               ")
-    print("=" * 70)
-    print(f" Initial Account Balance:        ₹{initial_balance:,.2f}")
-    print(f" Final Compounded Balance:       ₹{final_compounded_balance:,.2f}")
-    print(f" Total Days Processed:           {total_days_processed} days ({step_count} candles)")
-    print(f" Total Trades Executed:          {total_trades_executed} trades (max 3/day)")
-    print(f" Profitable Closed Trades (>2%): {profitable_closed_trades} trades")
-    print(f" Total Brokerage & STT Paid:     ₹{total_fees_paid:,.2f} (Round-trip)")
-    print(f" Gross Profit (Before Fees):     ₹{gross_profit:+,.2f} ({gross_return_pct:+.2f}%)")
-    print(f" Net Profit (After Fees):        ₹{net_profit:+,.2f} ({net_return_pct:+.2f}%)")
-    print(f" Sortino Ratio (Ann. 252d):      {sortino:.4f}")
-    print(f" Continuous Episode Status:      Completed Entire Test Horizon ({terminated})")
-    print("=" * 70 + "\n")
+    with open(evaluation_metrics_dir / "backtest_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
-    return loaded_model, final_compounded_balance, net_return_pct, sortino
+    portfolio_df = pd.DataFrame({"step": range(len(portfolio_values)), "portfolio_value": portfolio_values})
+    portfolio_df.to_csv(backtest_results_dir / "portfolio_history.csv", index=False)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(portfolio_values, label="Portfolio Balance (₹)", color="#2563EB", linewidth=1.5)
+        plt.axhline(initial_balance, color="gray", linestyle="--", alpha=0.7, label="Initial Capital")
+        plt.title(f"ATU Walk-Forward Out-of-Sample Equity Curve ({ticker})")
+        plt.xlabel("Intraday 5-Min Steps")
+        plt.ylabel("Balance (₹)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(backtest_results_dir / "equity_curve.png", dpi=150)
+        plt.close()
+        print(f"  - Equity curve plot saved: {backtest_results_dir / 'equity_curve.png'}")
+    except Exception as e:
+        print(f"  - Note: Matplotlib plot generation skipped ({e})")
+
+    report_text = f"""======================================================================
+             INTRADAY BACKTEST PERFORMANCE REPORT               
+======================================================================
+ Initial Account Balance:        ₹{metrics['initial_balance']:,.2f}
+ Final Compounded Balance:       ₹{metrics['final_balance']:,.2f}
+ Total Days Processed:           {metrics['total_days_processed']} days ({metrics['total_steps']} candles)
+ Total Trades Executed:          {metrics['total_trades']} trades (max 3/day)
+ Profitable Closed Trades (>2%): {metrics['profitable_trades']} trades
+ Win Rate:                       {metrics['win_rate_pct']:.2f}%
+ Total Brokerage & STT Paid:     ₹{metrics['total_fees_paid']:,.2f} (Round-trip)
+ Gross Profit (Before Fees):     ₹{metrics['gross_profit']:+,.2f} ({metrics['gross_return_pct']:+.2f}%)
+ Net Profit (After Fees):        ₹{metrics['net_profit']:+,.2f} ({metrics['net_return_pct']:+.2f}%)
+ Maximum Drawdown:               {metrics['max_drawdown_pct']:.2f}%
+ Sharpe Ratio (Annualized):      {metrics['sharpe_ratio']:.4f}
+ Sortino Ratio (Annualized):     {metrics['sortino_ratio']:.4f}
+ Continuous Episode Status:      Completed Entire Test Horizon ({metrics['continuous_episode_completed']})
+======================================================================"""
+
+    print("\n" + report_text + "\n")
+    with open(backtest_results_dir / "backtest_report.txt", "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    return loaded_model, final_compounded_balance, metrics["net_return_pct"], metrics["sortino_ratio"]
 
 
 if __name__ == "__main__":
@@ -332,7 +416,7 @@ if __name__ == "__main__":
         "--model-save-path",
         type=str,
         default="ppo_trading_agent_v1",
-        help="Path or directory to save the trained model checkpoint",
+        help="Path or directory to save model checkpoints and artifacts",
     )
     parser.add_argument(
         "--device",
@@ -340,6 +424,18 @@ if __name__ == "__main__":
         default="auto",
         choices=["auto", "cuda", "cpu"],
         help="Compute device for PPO and FinBERT ('auto', 'cuda', 'cpu')",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Directory containing historical news datasets (e.g. /content/drive/MyDrive/ATU_Data)",
+    )
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=None,
+        help="Frequency in timesteps to save intermediate PPO checkpoints",
     )
 
     args = parser.parse_args()
@@ -351,5 +447,6 @@ if __name__ == "__main__":
         use_finbert=args.finbert,
         model_save_path=args.model_save_path,
         device=args.device,
+        data_dir=args.data_dir,
+        checkpoint_freq=args.checkpoint_freq,
     )
-
