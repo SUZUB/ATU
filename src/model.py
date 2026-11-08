@@ -74,6 +74,7 @@ def create_ppo_agent(
     verbose: int = 1,
     seed: int = 42,
     device: str = "auto",
+    tensorboard_log: Optional[str] = None,
 ) -> PPO:
     """
     Instantiates a PPO model with an MlpPolicy tuned for financial time series.
@@ -92,5 +93,6 @@ def create_ppo_agent(
         verbose=verbose,
         seed=seed,
         device=device,
+        tensorboard_log=tensorboard_log,
     )
 

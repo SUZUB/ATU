@@ -225,6 +225,8 @@ def run_pipeline(
     data_dir: Optional[str] = None,
     checkpoint_freq: Optional[int] = None,
     allow_synthetic_fallback: bool = False,
+    results_dir: Optional[str] = None,
+    tensorboard_log: Optional[str] = None,
 ) -> Tuple[PPO, float, float, float]:
     """
     Executes the complete Sequential Data Pipeline.
@@ -271,11 +273,15 @@ def run_pipeline(
         base_dir = base_output_dir
         model_name = "ppo_trading_agent_v1"
 
-    checkpoints_dir = base_dir / "checkpoints"
-    final_models_dir = base_dir / "final_models"
-    training_logs_dir = base_dir / "training_logs"
-    backtest_results_dir = base_dir / "backtest_results"
-    evaluation_metrics_dir = base_dir / "evaluation_metrics"
+    if base_dir.name.lower() == "checkpoints":
+        checkpoints_dir = base_dir
+    else:
+        checkpoints_dir = base_dir / "checkpoints"
+
+    final_models_dir = checkpoints_dir / "final_models"
+    training_logs_dir = Path(tensorboard_log) if tensorboard_log else (base_dir / "training_logs")
+    backtest_results_dir = Path(results_dir) if results_dir else (base_dir / "results")
+    evaluation_metrics_dir = backtest_results_dir
 
     for d in [checkpoints_dir, final_models_dir, training_logs_dir, backtest_results_dir, evaluation_metrics_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -294,6 +300,9 @@ def run_pipeline(
 
     # 4. Model Training
     print(f"\n[Pipeline Step 6] Initializing PPO (Device: {device}) & Training for {total_timesteps:,} Timesteps...")
+    print(f"  - TensorBoard Logs Path: {training_logs_dir}")
+    print(f"  - Checkpoints Path:      {checkpoints_dir}")
+    print(f"  - Results Path:          {backtest_results_dir}")
     model = create_ppo_agent(
         env=train_env,
         learning_rate=0.0003,
@@ -306,6 +315,7 @@ def run_pipeline(
         verbose=1,
         seed=42,
         device=device,
+        tensorboard_log=str(training_logs_dir),
     )
 
     model.learn(total_timesteps=total_timesteps, callback=callbacks)
@@ -383,9 +393,13 @@ def run_pipeline(
 
     with open(evaluation_metrics_dir / "backtest_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+    with open(evaluation_metrics_dir / "evaluation_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
     portfolio_df = pd.DataFrame({"step": range(len(portfolio_values)), "portfolio_value": portfolio_values})
     portfolio_df.to_csv(backtest_results_dir / "portfolio_history.csv", index=False)
+    portfolio_df.to_csv(backtest_results_dir / "backtest_portfolio_history.csv", index=False)
+    print(f"  - Backtest results CSV saved to: {backtest_results_dir / 'portfolio_history.csv'}")
 
     try:
         import matplotlib
@@ -496,6 +510,18 @@ if __name__ == "__main__":
         default=None,
         help="Frequency in timesteps to save intermediate PPO checkpoints",
     )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Directory to save backtesting CSV results, equity curves, and metrics",
+    )
+    parser.add_argument(
+        "--tensorboard-log",
+        type=str,
+        default=None,
+        help="Directory to save TensorBoard training logs",
+    )
 
     args = parser.parse_args()
 
@@ -509,4 +535,6 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         checkpoint_freq=args.checkpoint_freq,
         allow_synthetic_fallback=args.allow_synthetic_fallback,
+        results_dir=args.results_dir,
+        tensorboard_log=args.tensorboard_log,
     )

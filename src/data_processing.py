@@ -370,6 +370,8 @@ def load_archive_headlines(
     if archive_dir is not None:
         candidate_dirs.append(Path(archive_dir))
     candidate_dirs.extend([
+        Path("/content/drive/MyDrive/ATU_Workspace/datasets"),
+        Path("/content/drive/MyDrive/ATU_Workspace"),
         Path("/content/drive/MyDrive/ATU_Data"),
         Path("archive"),
         Path("../archive"),
