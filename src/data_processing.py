@@ -343,6 +343,7 @@ def load_archive_headlines(
     archive_dir: Optional[Union[str, Path]] = None,
     ticker: Optional[str] = None,
     max_rows: int = 1000,
+    allow_synthetic_fallback: bool = False,
 ) -> pd.DataFrame:
     """
     Loads real headlines from local archive directory or Google Drive dataset storage.
@@ -354,6 +355,13 @@ def load_archive_headlines(
       - analyst_ratings_processed.csv
       - raw_analyst_ratings.csv
       - raw_partner_headlines.csv
+
+    Args:
+        archive_dir: Directory path containing raw CSV files.
+        ticker: Target stock ticker symbol (e.g. 'AAPL').
+        max_rows: Maximum number of headlines to retrieve.
+        allow_synthetic_fallback: If False (default), raises an error when real data is missing.
+                                  If True, falls back to simulated headlines with an explicit warning.
 
     Returns:
         pd.DataFrame: Formatted with columns ['date', 'headline'].
@@ -377,7 +385,7 @@ def load_archive_headlines(
     for c_dir in candidate_dirs:
         for f_name in file_names:
             candidate = c_dir / f_name
-            if candidate.exists():
+            if candidate.exists() and candidate.stat().st_size > 0:
                 target_file = candidate
                 break
         if target_file is not None:
@@ -385,27 +393,50 @@ def load_archive_headlines(
 
     if target_file is not None:
         try:
-            df = pd.read_csv(target_file, nrows=max_rows * 5)
-            # Normalize title/headline column name
-            if "title" in df.columns and "headline" not in df.columns:
-                df = df.rename(columns={"title": "headline"})
+            # Memory-efficient chunked reader (does not load full 150MB+ file at once)
+            matched_frames = []
+            total_matched = 0
+            chunksize = 25000
 
-            # Filter by ticker if available
-            stock_col = next((c for c in df.columns if c.lower() in ["stock", "ticker"]), None)
-            if ticker is not None and stock_col is not None:
-                df = df[df[stock_col].astype(str).str.upper() == ticker.upper()]
+            for chunk in pd.read_csv(target_file, chunksize=chunksize):
+                if "title" in chunk.columns and "headline" not in chunk.columns:
+                    chunk = chunk.rename(columns={"title": "headline"})
 
-            df = df.dropna(subset=["headline", "date"])
+                stock_col = next((c for c in chunk.columns if c.lower() in ["stock", "ticker"]), None)
+                if ticker is not None and stock_col is not None:
+                    filtered = chunk[chunk[stock_col].astype(str).str.upper() == ticker.upper()].copy()
+                else:
+                    filtered = chunk.copy()
 
-            # Clean and normalize date to YYYY-MM-DD
-            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-            df = df.dropna(subset=["date"])
-            df = df[["date", "headline"]].head(max_rows)
-            return df
+                filtered = filtered.dropna(subset=["headline", "date"])
+                if not filtered.empty:
+                    filtered["date"] = pd.to_datetime(filtered["date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
+                    filtered = filtered.dropna(subset=["date"])
+                    matched_frames.append(filtered[["date", "headline"]])
+                    total_matched += len(filtered)
+                    if total_matched >= max_rows:
+                        break
+
+            if matched_frames:
+                df = pd.concat(matched_frames, ignore_index=True).head(max_rows)
+                print(f"  - Successfully loaded {len(df):,} real historical headlines from: {target_file}")
+                return df
+            else:
+                print(f"  - Notice: No headlines matching ticker '{ticker}' found in {target_file}")
         except Exception as e:
             print(f"Warning: Failed to parse archive headlines from {target_file}: {e}")
 
-    # Mock fallback if archive is absent
+    # If real data is missing or empty, handle fallback explicitly
+    if not allow_synthetic_fallback:
+        searched_paths = [str(d) for d in candidate_dirs]
+        raise FileNotFoundError(
+            f"CRITICAL: Real financial headlines for ticker '{ticker}' were not found in {searched_paths}.\n"
+            f"Silent synthetic fallback is disabled to prevent data leakage and guarantee real model integrity.\n"
+            f"Please ensure 'analyst_ratings_processed.csv' is uploaded to your dataset directory (e.g. /content/drive/MyDrive/ATU_Data/),\n"
+            f"or explicitly pass allow_synthetic_fallback=True (or --allow-synthetic-fallback) to opt into synthetic testing."
+        )
+
+    print("WARNING: Real headlines dataset not found. Using simulated fallback headlines as explicitly requested.")
     return pd.DataFrame(
         {
             "date": ["2024-01-02", "2024-01-03", "2024-01-04"],

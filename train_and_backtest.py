@@ -113,47 +113,37 @@ def build_final_state_vector(
     ticker: str = "AAPL",
     n_candles: int = 1500,
     use_live_market_data: bool = False,
-    use_finbert: bool = False,
+    use_finbert: bool = True,
     device: str = "auto",
     data_dir: Optional[str] = None,
+    allow_synthetic_fallback: bool = False,
 ) -> pd.DataFrame:
     """
     Merges File 1 (Market Features) + File 2 (Sentiment Scores) -> `final_state_vector`.
+    Guarantees that real sentiment headlines are loaded, scored via FinBERT, and aligned
+    date-for-date with the market data without silent zero or random substitution.
     """
-    print("[Pipeline 1/4] Processing Market Data (File 1)...")
-    market_proc = MarketDataProcessor()
+    print(f"\n[Pipeline 1/4] Ingesting Financial News Headlines for '{ticker}' (File 2)...")
+    headlines_df = load_archive_headlines(
+        archive_dir=data_dir,
+        ticker=ticker,
+        max_rows=1000,
+        allow_synthetic_fallback=allow_synthetic_fallback,
+    )
+    print(f"  - Actual Headlines Ingested: {len(headlines_df):,} records for ticker '{ticker}'")
 
-    if use_live_market_data:
-        try:
-            print(f"  - Downloading live 5-minute data for '{ticker}'...")
-            market_df = market_proc.process(ticker=ticker, period="60d", interval="5m")
-        except Exception as e:
-            print(f"  - Yahoo Finance fetch failed ({e}). Generating 5-min intraday market data...")
-            raw_market = generate_intraday_5min_market_data(n_rows=n_candles, initial_price=150.0)
-            market_df = market_proc.process_dataframe(raw_market)
-    else:
-        print(f"  - Generating {n_candles:,} intraday 5-min candles across trading sessions...")
-        raw_market = generate_intraday_5min_market_data(n_rows=n_candles, initial_price=150.0)
-        market_df = market_proc.process_dataframe(raw_market)
-
-    print(f"  - Market Data Processed: {market_df.shape[0]} candles, {market_df.shape[1]} features")
-
-    print("\n[Pipeline 2/4] Processing News Sentiment (File 2)...")
-    headlines_df = load_archive_headlines(archive_dir=data_dir, ticker=ticker, max_rows=500)
     sentiment_df: Optional[pd.DataFrame] = None
 
-    if use_finbert and not headlines_df.empty:
-        try:
-            device_arg = None if device == "auto" else device
-            sentiment_proc = SentimentProcessor(device=device_arg)
-            sentiment_df = sentiment_proc.process_news_dataframe(headlines_df, batch_size=32)
-            print(f"  - FinBERT Headlines Processed: {len(sentiment_df)} trading days")
-        except Exception as e:
-            print(f"  - FinBERT scoring skipped ({e}). Using simulated sentiment distribution.")
-            sentiment_df = None
-
-    if sentiment_df is None or sentiment_df.empty:
-        unique_dates = sorted(list(set(pd.to_datetime(market_df.index).strftime("%Y-%m-%d"))))
+    if use_finbert:
+        print("\n[Pipeline 2/4] Scoring News Sentiment via FinBERT (File 2)...")
+        device_arg = None if device == "auto" else device
+        sentiment_proc = SentimentProcessor(device=device_arg)
+        print(f"  - FinBERT Compute Device: {sentiment_proc.device.type.upper()}")
+        sentiment_df = sentiment_proc.process_news_dataframe(headlines_df, batch_size=32)
+        print(f"  - FinBERT Output: {len(headlines_df):,} headlines scored into {len(sentiment_df):,} distinct trading days")
+    elif allow_synthetic_fallback:
+        print("\n[Pipeline 2/4] FinBERT disabled. Generating synthetic sentiment (fallback explicitly allowed)...")
+        unique_dates = sorted(list(set(headlines_df["date"]))) if not headlines_df.empty else ["2024-01-02", "2024-01-03"]
         rng = np.random.default_rng(42)
         sentiment_df = pd.DataFrame(
             {
@@ -161,11 +151,67 @@ def build_final_state_vector(
                 "daily_sentiment": np.clip(rng.normal(0.05, 0.35, size=len(unique_dates)), -1.0, 1.0),
             }
         )
+    else:
+        raise ValueError(
+            "FinBERT sentiment scoring is disabled (use_finbert=False) and allow_synthetic_fallback is False.\n"
+            "To guarantee training integrity, please enable FinBERT scoring or pass --allow-synthetic-fallback."
+        )
 
-    print("\n[Pipeline 3/4] Merging Processors into 'final_state_vector'...")
+    if sentiment_df is None or sentiment_df.empty:
+        if not allow_synthetic_fallback:
+            raise ValueError(
+                f"No valid sentiment scores were generated for ticker '{ticker}'.\n"
+                f"Silent synthetic fallback is disabled. Verify that your headlines dataset contains valid records."
+            )
+        else:
+            print("WARNING: Empty sentiment scores. Generating simulated sentiment fallback...")
+            rng = np.random.default_rng(42)
+            sentiment_df = pd.DataFrame(
+                {
+                    "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
+                    "daily_sentiment": [0.15, -0.20, 0.05],
+                }
+            )
+
+    # Align market data starting date with real headline dates
+    market_start_date = sentiment_df["date"].min() if not sentiment_df.empty else "2024-01-02"
+    print(f"\n[Pipeline 3/4] Processing Market Data & Technical Indicators (File 1)...")
+    print(f"  - Synchronizing market time series start date to sentiment anchor: {market_start_date}")
+    market_proc = MarketDataProcessor()
+
+    if use_live_market_data:
+        try:
+            print(f"  - Downloading live 5-minute data for '{ticker}'...")
+            market_df = market_proc.process(ticker=ticker, period="60d", interval="5m")
+        except Exception as e:
+            print(f"  - Yahoo Finance fetch failed ({e}). Generating aligned 5-min intraday market data...")
+            raw_market = generate_intraday_5min_market_data(n_rows=n_candles, start_date=market_start_date, initial_price=150.0)
+            market_df = market_proc.process_dataframe(raw_market)
+    else:
+        print(f"  - Generating {n_candles:,} intraday 5-min candles starting from {market_start_date}...")
+        raw_market = generate_intraday_5min_market_data(n_rows=n_candles, start_date=market_start_date, initial_price=150.0)
+        market_df = market_proc.process_dataframe(raw_market)
+
+    print(f"  - Market Data Processed: {market_df.shape[0]:,} candles, {market_df.shape[1]} features")
+
+    print("\n[Pipeline 4/4] Merging Processors into 'final_state_vector'...")
     final_state_vector = create_final_state_vector(market_df, sentiment_df)
+    sentiment_series = final_state_vector["daily_sentiment"]
+    non_zero_pct = float((sentiment_series != 0.0).mean()) * 100.0
+
     print(f"  - final_state_vector Shape: {final_state_vector.shape}")
     print(f"  - Features: {list(final_state_vector.columns)}")
+    print(f"  - Sentiment Feature Statistics:")
+    print(f"      * Mean:     {sentiment_series.mean():+.4f}")
+    print(f"      * Std Dev:  {sentiment_series.std():.4f}")
+    print(f"      * Min/Max:  [{sentiment_series.min():+.4f}, {sentiment_series.max():+.4f}]")
+    print(f"      * Non-Zero: {non_zero_pct:.1f}% of state vectors")
+
+    if non_zero_pct == 0.0 and not allow_synthetic_fallback:
+        raise ValueError(
+            "CRITICAL INTEGRITY FAILURE: All sentiment features in final_state_vector are 0.0!\n"
+            "Real sentiment dates did not overlap with market candles. Check date alignment."
+        )
 
     return final_state_vector
 
@@ -174,11 +220,12 @@ def run_pipeline(
     total_timesteps: int = 200000,
     ticker: str = "AAPL",
     use_live_market_data: bool = False,
-    use_finbert: bool = False,
+    use_finbert: bool = True,
     model_save_path: str = "ppo_trading_agent_v1",
     device: str = "auto",
     data_dir: Optional[str] = None,
     checkpoint_freq: Optional[int] = None,
+    allow_synthetic_fallback: bool = False,
 ) -> Tuple[PPO, float, float, float]:
     """
     Full Sequential Execution Pipeline:
@@ -196,6 +243,7 @@ def run_pipeline(
         use_finbert=use_finbert,
         device=device,
         data_dir=data_dir,
+        allow_synthetic_fallback=allow_synthetic_fallback,
     )
 
     # 2. Chronological Split: 80% Train, 20% Test
@@ -419,7 +467,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--finbert",
         action="store_true",
-        help="Score news sentiment using FinBERT model (CUDA/CPU)",
+        default=True,
+        help="Enable FinBERT news sentiment scoring (default: True)",
+    )
+    parser.add_argument(
+        "--no-finbert",
+        action="store_false",
+        dest="finbert",
+        help="Disable FinBERT news sentiment scoring",
+    )
+    parser.add_argument(
+        "--allow-synthetic-fallback",
+        action="store_true",
+        default=False,
+        help="Explicitly permit fallback to synthetic headlines/sentiment if real dataset is absent (default: False)",
     )
     parser.add_argument(
         "--model-save-path",
@@ -458,4 +519,5 @@ if __name__ == "__main__":
         device=args.device,
         data_dir=args.data_dir,
         checkpoint_freq=args.checkpoint_freq,
+        allow_synthetic_fallback=args.allow_synthetic_fallback,
     )
