@@ -353,12 +353,10 @@ class ConstrainedTradingEnv(gym.Env):
                 net_fraction = self._close_position_and_compound()
                 trade_closed_profit = bool(net_fraction > 0.0)
 
-                if net_fraction >= self.profit_target:
-                    close_reward = 20.0
-                elif net_fraction > 0.0:
-                    close_reward = net_fraction * 10.0
+                if net_fraction > 0.0:
+                    close_reward = float(net_fraction * 50.0)
                 else:
-                    close_reward = net_fraction * 10.0
+                    close_reward = float(net_fraction * 10.0)
 
                 effective_action = 0.0
                 step_reward += close_reward
@@ -372,12 +370,10 @@ class ConstrainedTradingEnv(gym.Env):
                 net_fraction = self._close_position_and_compound()
                 trade_closed_profit = bool(net_fraction > 0.0)
 
-                if net_fraction >= self.profit_target:
-                    close_reward = 20.0
-                elif net_fraction > 0.0:
-                    close_reward = net_fraction * 10.0
+                if net_fraction > 0.0:
+                    close_reward = float(net_fraction * 50.0)
                 else:
-                    close_reward = net_fraction * 10.0
+                    close_reward = float(net_fraction * 10.0)
 
                 step_reward += close_reward
 
@@ -417,7 +413,7 @@ class ConstrainedTradingEnv(gym.Env):
 
         self.last_action = act_val
 
-        # 6. Evaluate In-Trade Triggers: Stop-Loss, 15:15 Cut-off & Profit Target
+        # 6. Evaluate In-Trade Triggers: Stop-Loss, 15:15 Cut-off & Uncapped Momentum Holding
         next_time = self.dates[self.current_step].time()
 
         if self.is_active_position:
@@ -441,18 +437,13 @@ class ConstrainedTradingEnv(gym.Env):
                 else:
                     step_reward += float(net_fraction * 10.0)
 
-            # Trigger C: Continuous Profit Taking (+2% target hit with 1:2 risk-reward reward)
-            elif self.unrealized_profit >= self.profit_target:
-                self._close_position_and_compound()
-                step_reward += 20.0
-                trade_closed_profit = True
-
             else:
-                # Ongoing step holding reward (Symmetric)
+                # Uncapped Momentum Holding: Agent decides exit via actions.
+                # Asymmetric holding reward: aggressively reward momentum, proportionally penalize drawdowns.
                 if step_profit > 0.0:
-                    step_reward += float(step_profit * 10.0)
+                    step_reward += float(step_profit * 50.0)
                 else:
-                    step_reward += float(step_profit * 10.0)  # step_profit is already negative, naturally subtracts symmetrically
+                    step_reward += float(step_profit * 10.0)
 
         # 7. Unbroken Continuous Episode: ONLY terminate at absolute end of dataset
         terminated = False

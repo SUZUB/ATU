@@ -92,6 +92,10 @@ def calculate_financial_metrics(
 
     win_rate = (profitable_trades / total_trades * 100.0) if total_trades > 0 else 0.0
 
+    pos_profits = float(np.sum(ret_arr[ret_arr > 0])) if len(ret_arr) > 0 else 0.0
+    neg_losses = float(np.abs(np.sum(ret_arr[ret_arr < 0]))) if len(ret_arr) > 0 else 0.0
+    profit_factor = (pos_profits / neg_losses) if neg_losses > 1e-9 else (float("inf") if pos_profits > 0.0 else 0.0)
+
     return {
         "initial_balance": float(initial_balance),
         "final_balance": float(final_balance),
@@ -106,6 +110,7 @@ def calculate_financial_metrics(
         "max_drawdown_pct": float(max_drawdown_pct),
         "sharpe_ratio": float(sharpe),
         "sortino_ratio": float(sortino),
+        "profit_factor": float(profit_factor),
     }
 
 
