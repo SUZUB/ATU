@@ -474,6 +474,9 @@ class ConstrainedTradingEnv(gym.Env):
             "days_processed": int(len(self.unique_dates_seen)),
         }
 
+        # Mathematical Safety Rail: Strict reward clipping [-100.0, 100.0] to prevent exploding gradients
+        step_reward = float(np.clip(step_reward, -100.0, 100.0))
+
         return observation, step_reward, terminated, truncated, info
 
 
