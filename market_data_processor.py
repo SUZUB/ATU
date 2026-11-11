@@ -77,6 +77,59 @@ BOUNDED_0_100_COLUMNS: List[str] = ["RSI", "ADX"]
 DEFAULT_TRAIN_RATIO: float = 0.8
 
 
+# =====================================================================
+# yfinance HTTP session (robust browser impersonation)
+# =====================================================================
+# yfinance always asks curl_cffi for the alias "chrome", which resolves to the NEWEST
+# profile the curl_cffi Python layer knows (e.g. chrome152). If the loaded native
+# library is older (common on Colab after in-place upgrades), every request fails with
+# ImpersonateError, Yahoo's cookie/crumb step is skipped and downloads come back empty
+# ("possibly delisted"). We probe profiles from newest to oldest and keep the first one
+# the installed library actually supports.
+_YF_IMPERSONATE_CANDIDATES = (
+    "chrome", "chrome146", "chrome145", "chrome142", "chrome136", "chrome133a", "chrome131",
+    "chrome124", "chrome123", "chrome120", "chrome116", "chrome110", "edge101", "safari",
+)
+_YF_SESSION_STATE: Dict[str, Any] = {}
+
+
+def get_yfinance_session(probe_url: str = "https://fc.yahoo.com") -> Optional[Any]:
+    """
+    Returns a curl_cffi Session using the newest browser profile that works with the
+    installed curl_cffi build, or None (yfinance default) if curl_cffi is unavailable
+    or no profile works. The result is cached for the process.
+    """
+    if "session" in _YF_SESSION_STATE:
+        return _YF_SESSION_STATE["session"]
+
+    session, profile = None, None
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        curl_requests = None
+
+    if curl_requests is not None:
+        rejected: List[str] = []
+        for candidate in _YF_IMPERSONATE_CANDIDATES:
+            try:
+                trial = curl_requests.Session(impersonate=candidate)
+                trial.get(probe_url, timeout=10)
+            except Exception as e:  # noqa: BLE001 - classify by name across curl_cffi versions
+                if "Impersonat" in type(e).__name__ or "not supported" in str(e):
+                    rejected.append(candidate)
+                    continue
+                # Profile accepted; failure was ordinary network trouble (keep the profile)
+            session, profile = trial, candidate
+            break
+        if rejected:
+            print(f"  - curl_cffi rejected browser profiles {rejected}; using '{profile}' for Yahoo Finance.")
+        if session is None:
+            warnings.warn("No curl_cffi browser profile works; falling back to yfinance's default session.", stacklevel=2)
+
+    _YF_SESSION_STATE.update(session=session, profile=profile)
+    return session
+
+
 def compute_split_index(n_rows: int, train_ratio: float = DEFAULT_TRAIN_RATIO) -> int:
     """
     Chronological train/test boundary. Training pipelines MUST split with this
@@ -145,11 +198,15 @@ class MarketDataProcessor:
         else:
             download_kwargs["period"] = period
 
-        df: pd.DataFrame = yf.download(**download_kwargs)
+        session = get_yfinance_session()
+        df: pd.DataFrame = yf.download(**download_kwargs, session=session)
 
         if df.empty:
             raise ValueError(
-                f"No data returned for ticker '{ticker}' with parameters: {download_kwargs}"
+                f"No data returned for ticker '{ticker}' with parameters: {download_kwargs}. "
+                f"If the log shows 'possibly delisted' or a Cookie/crumb ImpersonateError, Yahoo "
+                f"rejected the request (browser profile: {_YF_SESSION_STATE.get('profile')}); the "
+                f"symbol itself is usually fine. Check the yfinance smoke-test line printed by Cell 1."
             )
 
         # Flatten MultiIndex columns introduced in recent yfinance versions
@@ -415,7 +472,7 @@ def is_indian_ticker(ticker: str) -> bool:
 def lookup_company_name(ticker: str) -> Optional[str]:
     """Company name without legal suffixes (e.g. 'Apple Inc.' -> 'Apple'), or None if unavailable."""
     try:
-        info = yf.Ticker(ticker).info or {}
+        info = yf.Ticker(ticker, session=get_yfinance_session()).info or {}
     except Exception:
         return None
     name = str(info.get("longName") or info.get("shortName") or "").strip()
@@ -444,7 +501,7 @@ def _naive_day(value: Union[str, pd.Timestamp]) -> pd.Timestamp:
 def _fetch_yfinance_news(ticker: str, count: int = 100) -> List[Dict[str, Any]]:
     """Most recent headlines from Yahoo Finance (typically only the last few days)."""
     try:
-        yf_ticker = yf.Ticker(ticker)
+        yf_ticker = yf.Ticker(ticker, session=get_yfinance_session())
         try:
             items = yf_ticker.get_news(count=count)
         except TypeError:  # older yfinance without `count`
