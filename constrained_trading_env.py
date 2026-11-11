@@ -1,67 +1,80 @@
 """
 ConstrainedTradingEnv Module
 ============================
-A production-grade, custom Reinforcement Learning trading environment built on
-the modern Gymnasium API (gymnasium.Env) designed for intraday 5-minute market data
-with Continuous Compounding and realistic Margin Intraday Square-off (MIS) frictions:
+Intraday 5-minute trading environment (Gymnasium API) with continuous compounding
+and Margin Intraday Square-off (MIS) frictions.
 
-Key Architecture:
------------------
-1. Unbroken Continuous Episode:
-   - Runs the entire dataset (e.g., 60 days / 4,500 candles) as a single unbroken episode.
-   - Date Rollover NEVER terminates or truncates: it ONLY updates `self.current_date = current_date`,
-     resets `self.daily_trades_count = 0`, and resets `self.locked_out_for_day = False`.
-   - 15:15 Auto-Square-Off and -1% Stop-Loss NEVER set `terminated = True` or `truncated = True`.
-   - The ONLY line in the entire `step()` function that returns a termination flag is at the
-     absolute end of the dataset: `if self.current_step >= len(self.df) - 1: terminated = True`.
-2. True Compounding (Dynamic Risk & Balance):
-   - When a position is closed (manual exit, target reached, stop-loss hit, or 15:15 square-off),
-     exit fees are deducted, net PnL is calculated, and it is permanently added to
-     `self.account_balance`.
-   - `self.unrealized_profit` resets to 0.0.
-   - The 1% Risk Manager dynamically calculates risk using the live compounding `self.account_balance`.
-3. Day-Lock Penalty for Stop-Loss:
-   - If the -1% stop-loss triggers, the trade is squared off, balance is compounded, flat penalty
-     of -10.0 is applied, and `self.locked_out_for_day = True` is set.
-   - While `locked_out_for_day` is True, all actions are overridden to 0.0 (Hold).
-   - `self.locked_out_for_day = False` and `self.daily_trades_count = 0` reset when the date rolls over.
-4. 15:15 MIS Auto-Square-Off:
-   - At or past 15:15:00, any open position is forcefully closed, exit fee is deducted, net PnL
-     is permanently compounded into `self.account_balance`, and the agent remains flat until the
-     next morning session (09:15:00) with `terminated = False` and `truncated = False`.
-5. Round-Trip Brokerage & STT Transaction Costs:
-   - `self.commission_rate = 0.0003` (0.03% brokerage, turnover charges, and STT).
-   - Deducted twice per full trade lifecycle (entry leg and exit leg).
-   - All deductions are tracked in `self.total_fees_paid`.
+Design (v4):
+------------
+1. Raw-price accounting:
+   P&L, account balance and stop-loss checks use the UNSCALED close price
+   (`raw_close` column). Scaled features are used only for the observation.
+2. Discrete execution:
+   action > +threshold -> target Long (+1); action < -threshold -> target Short (-1);
+   otherwise -> Flat (0). Position size is fixed at entry and never resized while
+   held. Brokerage is charged only on entry and exit legs (a flip = exit + entry).
+3. Reward = net profit of the step in currency:
+   (equity after step) - (equity before step), where equity = cash + mark-to-market
+   of the open position. Fees are already deducted from cash, so they are included.
+   No multipliers, no clipping.
+4. Position sizing:
+   Notional = account_balance * max_risk_per_trade / |loss_limit| at entry, so a
+   stop-loss hit loses ~max_risk_per_trade of equity (defaults: 1% / 1% -> 1.0x).
+5. Rules:
+   - Max `max_daily_trades` entries per calendar day.
+   - Stop-loss: when the open position's price move reaches `loss_limit` (-1%), it is
+     closed at that bar's close and the agent is locked out for the rest of the day.
+   - 15:15 MIS square-off: positions are closed on the first bar at/after 15:15; no
+     new entries until the next session.
+   - Positions are never carried overnight (safety close on date rollover).
+   - One unbroken episode over the whole dataset; terminates only at the final bar.
+
+Observation:
+------------
+[market features (scaled; `raw_close` excluded)] +
+[unrealized_profit, current_position_direction, time_of_day, trades_remaining, locked_out_status]
 """
 
 from datetime import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+import warnings
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
 
 
+RAW_PRICE_COLUMN: str = "raw_close"
+
+
+def _seconds(t: time) -> int:
+    return t.hour * 3600 + t.minute * 60 + t.second
+
+
 class ConstrainedTradingEnv(gym.Env):
     """
-    Intraday continuous-action trading environment with continuous compounding,
-    dynamic risk scaling, 15:15 MIS auto-square-off, and day-lock stop-loss enforcement.
+    Action Space:
+        Box(-1.0, 1.0, shape=(1,)), interpreted as a discrete target position.
 
     Observation Space:
-    ------------------
-    Box(num_features + 1,): All numeric features from the provided DataFrame
-    plus one dynamic feature: `unrealized_profit`.
-
-    Action Space:
-    -------------
-    Box(-1.0, 1.0, shape=(1,)):
-    - Direction: Sign of action (+1 for Long/Buy, -1 for Short/Sell, 0 for Flat).
-    - Threshold: |action| > 0.1 signifies active trade intent; <= 0.1 signifies Flat/Hold.
-    - Sizing: Scaled by Risk Manager up to max 1.0% (0.01) risk of live `account_balance`.
+        Box(num_features + 5,):
+            market features...,
+            unrealized_profit          (fraction of entry notional, gross of fees),
+            current_position_direction (-1, 0, 1),
+            time_of_day                (fraction of session elapsed, 0..1),
+            trades_remaining           (integer, 0..max_daily_trades),
+            locked_out_status          (0 or 1).
     """
 
-    metadata = {"render_modes": ["human"], "version": "3.3.0"}
+    metadata = {"render_modes": ["human"], "version": "4.0.0"}
+
+    STATE_FEATURE_NAMES: Tuple[str, ...] = (
+        "unrealized_profit",
+        "current_position_direction",
+        "time_of_day",
+        "trades_remaining",
+        "locked_out_status",
+    )
 
     def __init__(
         self,
@@ -74,34 +87,47 @@ class ConstrainedTradingEnv(gym.Env):
         max_daily_trades: int = 3,
         auto_square_off_time: time = time(15, 15, 0),
         price_col: str = "Close",
+        raw_price_col: str = RAW_PRICE_COLUMN,
+        session_start_time: time = time(9, 15, 0),
+        session_end_time: time = time(15, 30, 0),
+        action_threshold: float = 0.1,
     ) -> None:
         """
-        Initializes the ConstrainedTradingEnv.
-
         Args:
-            df: DataFrame containing normalized OHLCV, indicators, and sentiment with DatetimeIndex.
-            initial_balance: Starting account equity in currency units (default: 100,000.0).
-            max_risk_per_trade: Maximum allowable fraction of account equity risked on a trade (0.01 = 1%).
-            profit_target: Target profit fraction triggering +20 reward and reset (0.02 = 2%).
-            loss_limit: Stop-loss threshold triggering day-lock (-0.01 = -1%).
-            commission_rate: Transaction fee fraction per single leg (0.0003 = 0.03%).
-            max_daily_trades: Maximum permitted trade entries per calendar day (default: 3).
-            auto_square_off_time: Cut-off time for MIS intraday square-off (default: 15:15:00).
-            price_col: Column name to use for computing step returns (default: 'Close').
+            df: Feature DataFrame with DatetimeIndex (or 'date'/'Date' column). Must contain
+                unscaled prices in `raw_price_col`; otherwise `price_col` is used and must
+                itself be unscaled.
+            initial_balance: Starting equity.
+            max_risk_per_trade: Fraction of equity lost if the stop-loss is hit (drives sizing).
+            profit_target: Reserved; not enforced (the agent chooses its exits).
+            loss_limit: Stop-loss threshold as a price-move fraction of the position (negative).
+            commission_rate: Fee fraction charged on each leg's traded notional.
+            max_daily_trades: Maximum entries per calendar day.
+            auto_square_off_time: MIS cut-off time.
+            price_col: Fallback price column if `raw_price_col` is absent.
+            raw_price_col: Column holding unscaled close prices (excluded from observations).
+            session_start_time / session_end_time: Session bounds for `time_of_day`.
+            action_threshold: |action| above this opens/holds a directional position.
         """
         super().__init__()
 
         if df.empty or len(df) < 3:
             raise ValueError("Input DataFrame must contain at least 3 rows of market data.")
+        if loss_limit >= 0:
+            raise ValueError(f"loss_limit must be negative, got {loss_limit}")
+        if max_risk_per_trade <= 0:
+            raise ValueError(f"max_risk_per_trade must be positive, got {max_risk_per_trade}")
+        if _seconds(session_end_time) <= _seconds(session_start_time):
+            raise ValueError("session_end_time must be after session_start_time")
 
-        # Extract and validate DatetimeIndex
+        # Timestamps
         if isinstance(df.index, pd.DatetimeIndex):
             self.dates = df.index
         elif "date" in df.columns or "Date" in df.columns:
             date_col = "date" if "date" in df.columns else "Date"
-            self.dates = pd.to_datetime(df[date_col])
+            self.dates = pd.DatetimeIndex(pd.to_datetime(df[date_col]))
         else:
-            self.dates = pd.to_datetime(df.index)
+            self.dates = pd.DatetimeIndex(pd.to_datetime(df.index))
 
         self.df = df.copy().reset_index(drop=True)
         self.initial_balance: float = float(initial_balance)
@@ -111,55 +137,91 @@ class ConstrainedTradingEnv(gym.Env):
         self.commission_rate: float = float(commission_rate)
         self.max_daily_trades: int = int(max_daily_trades)
         self.auto_square_off_time: time = auto_square_off_time
+        self.action_threshold: float = float(action_threshold)
+        self._session_start_s: int = _seconds(session_start_time)
+        self._session_len_s: int = _seconds(session_end_time) - self._session_start_s
 
-        # Locate price column for calculating returns
-        if price_col in self.df.columns:
-            self.price_col: str = price_col
-        elif price_col.lower() in self.df.columns:
-            self.price_col = price_col.lower()
-        elif "Close" in self.df.columns:
-            self.price_col = "Close"
-        elif "close" in self.df.columns:
-            self.price_col = "close"
+        # Fixed leverage so that a stop-loss hit costs ~max_risk_per_trade of equity
+        self.position_leverage: float = self.max_risk_per_trade / abs(self.loss_limit)
+
+        # Unscaled price series for all accounting
+        if raw_price_col in self.df.columns:
+            self.raw_price_col: str = raw_price_col
         else:
-            self.price_col = self.df.columns[3] if len(self.df.columns) > 3 else self.df.columns[0]
+            fallback = next(
+                (c for c in (price_col, price_col.lower(), "Close", "close") if c in self.df.columns),
+                None,
+            )
+            if fallback is None:
+                raise KeyError(f"Neither '{raw_price_col}' nor '{price_col}' found in DataFrame.")
+            warnings.warn(
+                f"'{raw_price_col}' column not found; using '{fallback}' for P&L. "
+                "It MUST contain unscaled prices.",
+                stacklevel=2,
+            )
+            self.raw_price_col = fallback
 
-        # Extract numeric features and price series
+        self.prices: np.ndarray = self.df[self.raw_price_col].to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(self.prices)) or np.any(self.prices <= 0.0):
+            raise ValueError(
+                f"Price column '{self.raw_price_col}' must contain strictly positive, finite, "
+                "UNSCALED prices. MinMax-scaled prices (which reach 0.0) produce meaningless returns."
+            )
+
+        # Observation features: all numeric columns except the dedicated raw price column
         numeric_df = self.df.select_dtypes(include=[np.number])
+        if self.raw_price_col == raw_price_col:
+            numeric_df = numeric_df.drop(columns=[self.raw_price_col])
+        self.feature_columns: List[str] = list(numeric_df.columns)
         self.features: np.ndarray = numeric_df.to_numpy(dtype=np.float32)
-        self.prices: np.ndarray = self.df[self.price_col].to_numpy(dtype=np.float64)
         self.num_rows: int = len(self.df)
         self.num_features: int = self.features.shape[1]
 
-        # Continuous Action Space: [-1.0, 1.0]
-        self.action_space: spaces.Box = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(1,),
-            dtype=np.float32,
-        )
-
-        # Observation Space: num_features + 1 (unrealized_profit)
+        self.action_space: spaces.Box = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         self.observation_space: spaces.Box = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.num_features + 1,),
+            shape=(self.num_features + len(self.STATE_FEATURE_NAMES),),
             dtype=np.float32,
         )
 
-        # Compounding Account Balance & State Tracking
-        self.account_balance: float = self.initial_balance
+        self._reset_state()
+
+    # ------------------------------------------------------------------
+    # State helpers
+    # ------------------------------------------------------------------
+    def _reset_state(self) -> None:
         self.current_step: int = 0
         self.current_date = self.dates[0].date()
+        self.unique_dates_seen: set = {self.current_date}
+        self.account_balance: float = self.initial_balance  # realized cash
         self.daily_trades_count: int = 0
         self.total_trades: int = 0
+        self.closed_trades: int = 0
+        self.winning_trades: int = 0
         self.total_fees_paid: float = 0.0
-        self.unrealized_profit: float = 0.0
-        self.is_active_position: bool = False
-        self.position_direction: int = 0  # 0: Flat, 1: Long, -1: Short
         self.locked_out_for_day: bool = False
         self.last_action: float = 0.0
-        self.unique_dates_seen: set = {self.current_date}
+        self._clear_position()
+
+    def _clear_position(self) -> None:
+        self.position_direction: int = 0
+        self.shares: float = 0.0
+        self.entry_price: float = 0.0
+        self.entry_notional: float = 0.0
+        self.entry_fee: float = 0.0
+        self.unrealized_pnl: float = 0.0  # currency, gross of fees
+
+    @property
+    def is_active_position(self) -> bool:
+        return self.position_direction != 0
+
+    @property
+    def unrealized_profit(self) -> float:
+        """Open-position price move as a fraction of entry notional (gross of fees)."""
+        if not self.is_active_position or self.entry_notional <= 0.0:
+            return 0.0
+        return self.unrealized_pnl / self.entry_notional
 
     @property
     def current_unrealized_profit(self) -> float:
@@ -167,407 +229,258 @@ class ConstrainedTradingEnv(gym.Env):
         return self.unrealized_profit
 
     @property
+    def equity(self) -> float:
+        """Mark-to-market equity: realized cash + open-position P&L."""
+        return self.account_balance + self.unrealized_pnl
+
+    @property
     def balance(self) -> float:
-        """Live mark-to-market portfolio balance."""
-        if self.is_active_position:
-            return self.account_balance * (1.0 + self.unrealized_profit)
-        return self.account_balance
+        """Backward-compatible alias for mark-to-market equity."""
+        return self.equity
 
-    def _apply_risk_manager(self, action: Union[float, np.ndarray]) -> float:
-        """
-        Enforces maximum single-trade risk limit (1.0% = 0.01) calculated dynamically
-        against the live compounding account balance.
+    @property
+    def trades_remaining(self) -> int:
+        return max(0, self.max_daily_trades - self.daily_trades_count)
 
-        Args:
-            action: Raw continuous action in [-1.0, 1.0].
-
-        Returns:
-            float: Signed risk fraction in [-0.01, 0.01].
-        """
-        act_val = float(action[0]) if isinstance(action, (np.ndarray, list)) else float(action)
-        clipped_action = float(np.clip(act_val, -1.0, 1.0))
-        applied_risk = clipped_action * self.max_risk_per_trade
-        return float(applied_risk)
+    def _time_of_day(self) -> float:
+        t = self.dates[self.current_step].time()
+        frac = (_seconds(t) - self._session_start_s) / self._session_len_s
+        return float(np.clip(frac, 0.0, 1.0))
 
     def _get_observation(self) -> np.ndarray:
-        """
-        Constructs the current state vector: feature slice + unrealized_profit.
-        """
-        current_features = self.features[self.current_step]
-        profit_feature = np.array([self.unrealized_profit], dtype=np.float32)
-        return np.concatenate([current_features, profit_feature], dtype=np.float32)
+        state = np.array(
+            [
+                self.unrealized_profit,
+                float(self.position_direction),
+                self._time_of_day(),
+                float(self.trades_remaining),
+                float(self.locked_out_for_day),
+            ],
+            dtype=np.float32,
+        )
+        return np.concatenate([self.features[self.current_step], state]).astype(np.float32)
 
-    def _deduct_leg_fee(self) -> float:
-        """
-        Helper method to apply single-leg commission fee (0.03% of live account balance).
-        Deducts fee from open trade unrealized profit and tracks in total_fees_paid.
+    def _action_to_target(self, action: Union[float, np.ndarray]) -> Tuple[float, int]:
+        act_val = float(np.asarray(action, dtype=np.float64).reshape(-1)[0])
+        if not np.isfinite(act_val):
+            act_val = 0.0
+        act_val = float(np.clip(act_val, -1.0, 1.0))
+        if act_val > self.action_threshold:
+            return act_val, 1
+        if act_val < -self.action_threshold:
+            return act_val, -1
+        return act_val, 0
 
-        Returns:
-            float: Fee amount in currency units.
-        """
-        fee_amount = self.commission_rate * self.account_balance
-        self.total_fees_paid += fee_amount
-        self.unrealized_profit -= self.commission_rate
-        return fee_amount
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+    def _open_position(self, direction: int, price: float) -> None:
+        notional = self.account_balance * self.position_leverage
+        fee = notional * self.commission_rate
+        self.account_balance -= fee
+        self.total_fees_paid += fee
 
-    def _close_position_and_compound(self) -> float:
-        """
-        Square off open position:
-        1. Deducts exit leg fee.
-        2. Calculates net profit/loss.
-        3. Permanently compounds net profit/loss into self.account_balance.
-        4. Resets position state and unrealized_profit to 0.0.
+        self.position_direction = int(direction)
+        self.shares = notional / price
+        self.entry_price = float(price)
+        self.entry_notional = float(notional)
+        self.entry_fee = float(fee)
+        self.unrealized_pnl = 0.0
 
-        Returns:
-            float: Realized trade net PnL fraction (after entry and exit fees).
-        """
-        self._deduct_leg_fee()
-        net_trade_fraction = self.unrealized_profit
-        net_trade_pnl_currency = net_trade_fraction * self.account_balance
+        self.daily_trades_count += 1
+        self.total_trades += 1
 
-        # Permanently compound into live account balance
-        self.account_balance += net_trade_pnl_currency
-        self.unrealized_profit = 0.0
-        self.is_active_position = False
-        self.position_direction = 0
+    def _close_position(self, price: float) -> float:
+        """Closes at `price`, realizes P&L into cash, returns the trade's net P&L (both fees)."""
+        gross_pnl = self.position_direction * self.shares * (price - self.entry_price)
+        exit_fee = self.shares * price * self.commission_rate
+        self.account_balance += gross_pnl - exit_fee
+        self.total_fees_paid += exit_fee
 
-        return net_trade_fraction
+        trade_net_pnl = gross_pnl - self.entry_fee - exit_fee
+        self.closed_trades += 1
+        if trade_net_pnl > 0.0:
+            self.winning_trades += 1
 
+        self._clear_position()
+        return float(trade_net_pnl)
+
+    def _mark_to_market(self, price: float) -> None:
+        if self.is_active_position:
+            self.unrealized_pnl = self.position_direction * self.shares * (price - self.entry_price)
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
     def reset(
         self,
         seed: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """
-        Resets environment to starting state.
-        """
         super().reset(seed=seed)
-
-        self.current_step = 0
-        self.current_date = self.dates[0].date()
-        self.daily_trades_count = 0
-        self.total_trades = 0
-        self.total_fees_paid = 0.0
-        self.unrealized_profit = 0.0
-        self.account_balance = self.initial_balance
-        self.is_active_position = False
-        self.position_direction = 0
-        self.locked_out_for_day = False
-        self.last_action = 0.0
-        self.unique_dates_seen = {self.current_date}
-
-        observation = self._get_observation()
-        info: Dict[str, Any] = {
-            "step": self.current_step,
-            "date": str(self.current_date),
-            "time": str(self.dates[self.current_step].time()),
-            "account_balance": float(self.account_balance),
-            "balance": float(self.balance),
-            "unrealized_profit": float(self.unrealized_profit),
-            "daily_trades_count": int(self.daily_trades_count),
-            "total_trades": int(self.total_trades),
-            "total_fees_paid": float(self.total_fees_paid),
-            "trade_closed_profit": False,
-            "locked_out_for_day": False,
-            "days_processed": len(self.unique_dates_seen),
-        }
-        return observation, info
+        self._reset_state()
+        info = self._build_info(
+            step_net_pnl=0.0,
+            step_return=0.0,
+            closed_trade_pnls=[],
+            stop_loss_hit=False,
+        )
+        return self._get_observation(), info
 
     def step(
         self, action: Union[float, np.ndarray]
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """
-        Executes one 5-minute candle step with continuous compounding, dynamic risk
-        management, 15:15 MIS auto-square-off, and day-lock stop-loss penalty.
-        Runs as a single unbroken continuous episode across the entire dataset.
-        """
-        # 1. Date & Time Tracking & Daily Rollover Reset
-        current_timestamp = self.dates[self.current_step]
-        current_date = current_timestamp.date()
-        current_time = current_timestamp.time()
+        equity_before = self.equity
+        price_now = float(self.prices[self.current_step])
+        time_now = self.dates[self.current_step].time()
+        closed_trade_pnls: List[float] = []
+        stop_loss_hit = False
 
-        self.unique_dates_seen.add(current_date)
-        if current_date != self.current_date:
-            # Rule 2: On date rollover, ONLY update current_date, reset daily count, and reset day-lock
-            self.current_date = current_date
+        # 1. Decide target position at the current bar's close
+        act_val, target = self._action_to_target(action)
+        if self.locked_out_for_day or time_now >= self.auto_square_off_time:
+            target = 0
+
+        # 2. Exit leg (close or first half of a flip)
+        if self.is_active_position and target != self.position_direction:
+            closed_trade_pnls.append(self._close_position(price_now))
+
+        # 3. Entry leg (subject to daily cap)
+        if target != 0 and not self.is_active_position and self.daily_trades_count < self.max_daily_trades:
+            self._open_position(target, price_now)
+
+        # 4. Advance one bar and mark the position to market on raw prices
+        self.current_step += 1
+        price_next = float(self.prices[self.current_step])
+        next_ts = self.dates[self.current_step]
+        self._mark_to_market(price_next)
+
+        # 5. In-trade risk rules at the new bar
+        new_day = next_ts.date() != self.current_date
+        if self.is_active_position:
+            if new_day:
+                # Safety: never carry an intraday position overnight
+                closed_trade_pnls.append(self._close_position(price_next))
+            elif self.unrealized_profit <= self.loss_limit:
+                closed_trade_pnls.append(self._close_position(price_next))
+                stop_loss_hit = True
+                self.locked_out_for_day = True
+            elif next_ts.time() >= self.auto_square_off_time:
+                closed_trade_pnls.append(self._close_position(price_next))
+
+        # 6. Date rollover: reset daily counters for the new session
+        self.unique_dates_seen.add(next_ts.date())
+        if new_day:
+            self.current_date = next_ts.date()
             self.daily_trades_count = 0
             self.locked_out_for_day = False
-            # Rule 3: ABSOLUTELY NO truncated = True or terminated = True here!
 
-        step_reward = 0.0
-        trade_closed_profit = False
-        effective_action = 0.0
+        # 7. Single unbroken episode: terminate only at the last bar
+        terminated = self.current_step >= self.num_rows - 1
+        truncated = False
+        if terminated and self.is_active_position:
+            closed_trade_pnls.append(self._close_position(price_next))
 
-        # 2. Check 15:15 MIS Auto-Square-Off on Existing Open Position
-        if current_time >= self.auto_square_off_time and self.is_active_position:
-            # Forcefully close position at 15:15 without terminating/truncating the episode
-            net_fraction = self._close_position_and_compound()
-            trade_closed_profit = bool(net_fraction > 0.0)
-
-            if net_fraction > 0.0:
-                step_reward += float(net_fraction * 10.0)
-            else:
-                step_reward += float(net_fraction * 10.0)
-
-        # 3. Parse and Filter Raw Action
-        act_val = float(action[0]) if isinstance(action, (np.ndarray, list)) else float(action)
-        act_val = float(np.clip(act_val, -1.0, 1.0))
-
-        # Enforce Day-Lock Penalty or 15:15 intraday cut-off (Override action to Hold)
-        if self.locked_out_for_day or current_time >= self.auto_square_off_time:
-            target_direction = 0
-            act_val = 0.0
-        elif act_val > 0.1:
-            target_direction = 1   # Long
-        elif act_val < -0.1:
-            target_direction = -1  # Short
-        else:
-            target_direction = 0   # Flat / Hold
-
-        # 4. Position State Machine & Entry/Exit Fee Mechanics
-        if not self.is_active_position:
-            # Currently FLAT
-            if target_direction == 0:
-                effective_action = 0.0
-            else:
-                # Attempting to open a new position
-                if self.daily_trades_count >= self.max_daily_trades:
-                    # 3-Trade daily cap reached: Force Hold without artificial micro-penalty
-                    effective_action = 0.0
-                    act_val = 0.0
-                else:
-                    # Open new position
-                    self.daily_trades_count += 1
-                    self.total_trades += 1
-                    self.is_active_position = True
-                    self.position_direction = target_direction
-                    effective_action = act_val
-
-                    # Deduct Entry Leg Fee
-                    self._deduct_leg_fee()
-
-        else:
-            # Currently in an ACTIVE position
-            if target_direction == 0:
-                # Manual voluntary trade closure
-                net_fraction = self._close_position_and_compound()
-                trade_closed_profit = bool(net_fraction > 0.0)
-
-                if net_fraction > 0.0:
-                    close_reward = float(net_fraction * 50.0)
-                else:
-                    close_reward = float(net_fraction * 10.0)
-
-                effective_action = 0.0
-                step_reward += close_reward
-
-            elif target_direction == self.position_direction:
-                # Holding active trade
-                effective_action = act_val
-
-            else:
-                # Reversing position: Close existing trade + Attempt new trade
-                net_fraction = self._close_position_and_compound()
-                trade_closed_profit = bool(net_fraction > 0.0)
-
-                if net_fraction > 0.0:
-                    close_reward = float(net_fraction * 50.0)
-                else:
-                    close_reward = float(net_fraction * 10.0)
-
-                step_reward += close_reward
-
-                # Attempt new reverse trade entry
-                if (
-                    self.locked_out_for_day
-                    or self.daily_trades_count >= self.max_daily_trades
-                    or current_time >= self.auto_square_off_time
-                ):
-                    effective_action = 0.0
-                    act_val = 0.0
-                else:
-                    self.daily_trades_count += 1
-                    self.total_trades += 1
-                    self.is_active_position = True
-                    self.position_direction = target_direction
-                    effective_action = act_val
-
-                    # Deduct Entry Leg Fee for new trade
-                    self._deduct_leg_fee()
-
-        # 5. Advance Candle & Calculate Price Return
-        prev_price = self.prices[self.current_step]
-        self.current_step += 1
-        curr_price = self.prices[self.current_step]
-
-        if prev_price > 0:
-            price_return = (curr_price - prev_price) / prev_price
-        else:
-            price_return = 0.0
-
-        applied_risk = self._apply_risk_manager(effective_action)
-        step_profit = (applied_risk / self.max_risk_per_trade) * price_return
-
-        if self.is_active_position:
-            self.unrealized_profit += float(step_profit)
-
+        # 8. Reward = net currency profit of this step (fees included)
+        step_net_pnl = float(self.equity - equity_before)
+        step_return = step_net_pnl / equity_before if equity_before > 0.0 else 0.0
         self.last_action = act_val
 
-        # 6. Evaluate In-Trade Triggers: Stop-Loss, 15:15 Cut-off & Uncapped Momentum Holding
-        next_time = self.dates[self.current_step].time()
+        info = self._build_info(
+            step_net_pnl=step_net_pnl,
+            step_return=step_return,
+            closed_trade_pnls=closed_trade_pnls,
+            stop_loss_hit=stop_loss_hit,
+        )
+        info["action"] = float(act_val)
+        return self._get_observation(), step_net_pnl, terminated, truncated, info
 
-        if self.is_active_position:
-            # Trigger A: Strict -1% Stop-Loss with Day-Lock Penalty (Flat -10.0 penalty)
-            if self.unrealized_profit <= self.loss_limit:
-                step_reward -= 10.0
-
-                # Square off trade, deduct exit fee, and compound balance
-                self._close_position_and_compound()
-                trade_closed_profit = False
-
-                # Activate Day-Lock Penalty for the remainder of this calendar day
-                self.locked_out_for_day = True
-
-            # Trigger B: 15:15 MIS Auto-Square-Off at candle arrival (NEVER terminates episode)
-            elif next_time >= self.auto_square_off_time:
-                net_fraction = self._close_position_and_compound()
-                trade_closed_profit = bool(net_fraction > 0.0)
-                if net_fraction > 0.0:
-                    step_reward += float(net_fraction * 10.0)
-                else:
-                    step_reward += float(net_fraction * 10.0)
-
-            else:
-                # Uncapped Momentum Holding: Agent decides exit via actions.
-                # Asymmetric holding reward: aggressively reward momentum, proportionally penalize drawdowns.
-                if step_profit > 0.0:
-                    step_reward += float(step_profit * 50.0)
-                else:
-                    step_reward += float(step_profit * 10.0)
-
-        # 7. Unbroken Continuous Episode: ONLY terminate at absolute end of dataset
-        terminated = False
-        truncated = False
-
-        # Rule 4: ONLY line in the entire step() function that sets terminated = True
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-            if self.is_active_position:
-                self._close_position_and_compound()
-
-        observation = self._get_observation()
-        info: Dict[str, Any] = {
+    def _build_info(
+        self,
+        step_net_pnl: float,
+        step_return: float,
+        closed_trade_pnls: List[float],
+        stop_loss_hit: bool,
+    ) -> Dict[str, Any]:
+        ts = self.dates[self.current_step]
+        return {
             "step": self.current_step,
             "date": str(self.current_date),
-            "time": str(self.dates[self.current_step].time()),
+            "time": str(ts.time()),
+            "price": float(self.prices[self.current_step]),
             "account_balance": float(self.account_balance),
-            "balance": float(self.balance),
+            "balance": float(self.equity),
+            "equity": float(self.equity),
             "unrealized_profit": float(self.unrealized_profit),
-            "step_profit": float(step_profit),
-            "applied_risk": float(applied_risk),
-            "action": float(act_val),
+            "unrealized_pnl": float(self.unrealized_pnl),
+            "position_direction": int(self.position_direction),
+            "step_net_pnl": float(step_net_pnl),
+            "step_profit": float(step_return),  # net portfolio return of this step
             "daily_trades_count": int(self.daily_trades_count),
+            "trades_remaining": int(self.trades_remaining),
             "total_trades": int(self.total_trades),
+            "closed_trades": int(self.closed_trades),
+            "winning_trades": int(self.winning_trades),
             "total_fees_paid": float(self.total_fees_paid),
-            "trade_closed_profit": bool(trade_closed_profit),
+            "closed_trade_pnls": list(closed_trade_pnls),
+            "trade_closed": bool(closed_trade_pnls),
+            "trade_closed_profit": bool(any(p > 0.0 for p in closed_trade_pnls)),
+            "stop_loss_hit": bool(stop_loss_hit),
             "locked_out_for_day": bool(self.locked_out_for_day),
             "days_processed": int(len(self.unique_dates_seen)),
         }
-
-        # Mathematical Safety Rail: Strict reward clipping [-100.0, 100.0] to prevent exploding gradients
-        step_reward = float(np.clip(step_reward, -100.0, 100.0))
-
-        return observation, step_reward, terminated, truncated, info
 
 
 if __name__ == "__main__":
     np.random.seed(42)
 
-    # Generate 5-minute intraday mock data spanning 5 trading days (75 candles/day = 375 candles)
+    # 5 trading days of 5-minute bars (09:15-15:25, 75 bars/day)
     n_rows = 375
     timestamps = []
     curr_date = pd.Timestamp("2024-01-02")
     while len(timestamps) < n_rows:
         if curr_date.weekday() < 5:
-            day_candles = pd.date_range(
+            for ts in pd.date_range(
                 start=curr_date.replace(hour=9, minute=15),
                 end=curr_date.replace(hour=15, minute=25),
                 freq="5min",
-            )
-            for ts in day_candles:
+            ):
                 timestamps.append(ts)
                 if len(timestamps) == n_rows:
                     break
         curr_date += pd.Timedelta(days=1)
 
-    datetime_index = pd.DatetimeIndex(timestamps)
-    daily_returns = np.random.normal(0.0001, 0.003, n_rows)
-    close_prices = 150.0 * np.cumprod(1.0 + daily_returns)
-
+    close_prices = 150.0 * np.cumprod(1.0 + np.random.normal(0.0001, 0.003, n_rows))
     mock_df = pd.DataFrame(
         {
-            "Open": close_prices * (1.0 + np.random.normal(0, 0.001, n_rows)),
-            "High": close_prices * (1.0 + np.abs(np.random.normal(0, 0.002, n_rows))),
-            "Low": close_prices * (1.0 - np.abs(np.random.normal(0, 0.002, n_rows))),
-            "Close": close_prices,
-            "Volume": np.random.uniform(0.1, 1.0, n_rows),
-            "RSI": np.random.uniform(30.0, 70.0, n_rows),
-            "MACD": np.random.normal(0.0, 0.3, n_rows),
-            "MACD_Signal": np.random.normal(0.0, 0.3, n_rows),
-            "MACD_Diff": np.random.normal(0.0, 0.1, n_rows),
-            "ATR": np.random.uniform(0.5, 1.5, n_rows),
-            "BB_High": close_prices * 1.01,
-            "BB_Mid": close_prices * 1.00,
-            "BB_Low": close_prices * 0.98,
-            "ADX": np.random.uniform(15.0, 45.0, n_rows),
+            "Close": (close_prices - close_prices.min()) / (close_prices.max() - close_prices.min()),
+            "RSI": np.random.uniform(0.3, 0.7, n_rows),
             "daily_sentiment": np.random.uniform(-0.5, 0.5, n_rows),
+            RAW_PRICE_COLUMN: close_prices,
         },
-        index=datetime_index,
+        index=pd.DatetimeIndex(timestamps),
     )
-
-    print("==========================================================")
-    print(" ConstrainedTradingEnv Continuous Compounding Multi-Day   ")
-    print("==========================================================")
 
     env = ConstrainedTradingEnv(df=mock_df)
     obs, info = env.reset(seed=42)
-
-    print(f"Total Candles in Dataset: {len(mock_df)} (5 trading days)")
-    print(f"Starting Date:            {info['date']}")
-    print(f"Initial Account Balance:  ₹{env.account_balance:,.2f}\n")
+    print(f"Observation shape: {obs.shape} (features: {env.feature_columns} + {list(env.STATE_FEATURE_NAMES)})")
+    print(f"Initial equity: {env.equity:,.2f}\n")
 
     done = False
+    total_reward = 0.0
     step_idx = 0
-    trade_events = 0
-
     while not done:
-        # Alternating trade intents: buy every morning, hold across intraday
-        action = np.array([0.9 if step_idx % 25 == 0 else 0.5])
+        action = np.array([0.9 if (step_idx // 20) % 2 == 0 else 0.0])
         obs, reward, terminated, truncated, step_info = env.step(action)
+        total_reward += reward
         done = terminated or truncated
         step_idx += 1
+        if step_info["trade_closed"] and step_idx < 120:
+            print(
+                f"{step_info['date']} {step_info['time']} | closed {step_info['closed_trade_pnls']} | "
+                f"stop={step_info['stop_loss_hit']} | equity={step_info['equity']:,.2f}"
+            )
 
-        if (
-            step_info["trade_closed_profit"]
-            or step_info["locked_out_for_day"]
-            or step_info["time"].startswith("15:15")
-            or done
-        ):
-            trade_events += 1
-            if trade_events <= 10 or done:
-                print(
-                    f"Step {step_idx:03d} | Date: {step_info['date']} {step_info['time']} | "
-                    f"Trades: {step_info['daily_trades_count']}/3 | "
-                    f"LockedOut: {step_info['locked_out_for_day']} | "
-                    f"AccountBalance: ₹{step_info['account_balance']:,.2f} | "
-                    f"TotalFees: ₹{step_info['total_fees_paid']:,.2f} | "
-                    f"Terminated: {terminated} | Truncated: {truncated}"
-                )
-
-    print("\n--- Multi-Day Continuous Compounding Summary ---")
-    print(f"Total Steps Executed:     {step_idx}")
-    print(f"Total Days Processed:     {step_info['days_processed']}")
-    print(f"Total Trades Executed:    {step_info['total_trades']}")
-    print(f"Total Fees Paid:          ₹{step_info['total_fees_paid']:,.2f}")
-    print(f"Final Compounded Balance: ₹{step_info['account_balance']:,.2f}")
-    print(f"Episode Completed Cleanly at Dataset Horizon: {terminated}")
+    print(f"\nSteps: {step_idx} | Days: {step_info['days_processed']} | Trades: {step_info['total_trades']}")
+    print(f"Fees: {step_info['total_fees_paid']:,.2f} | Final equity: {step_info['equity']:,.2f}")
+    print(f"Sum of rewards: {total_reward:,.2f} == net P&L: {step_info['equity'] - env.initial_balance:,.2f}")
