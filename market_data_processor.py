@@ -93,11 +93,19 @@ _YF_IMPERSONATE_CANDIDATES = (
 _YF_SESSION_STATE: Dict[str, Any] = {}
 
 
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 def get_yfinance_session(probe_url: str = "https://fc.yahoo.com") -> Optional[Any]:
     """
-    Returns a curl_cffi Session using the newest browser profile that works with the
-    installed curl_cffi build, or None (yfinance default) if curl_cffi is unavailable
-    or no profile works. The result is cached for the process.
+    Returns an HTTP session for yfinance, cached for the process:
+      1. a curl_cffi Session with the newest browser profile the installed build supports;
+      2. otherwise a plain requests.Session with a browser User-Agent (yfinance accepts it),
+         so a broken curl_cffi install never reaches yfinance's own (failing) default;
+      3. None only if neither library is importable.
     """
     if "session" in _YF_SESSION_STATE:
         return _YF_SESSION_STATE["session"]
@@ -105,11 +113,13 @@ def get_yfinance_session(probe_url: str = "https://fc.yahoo.com") -> Optional[An
     session, profile = None, None
     try:
         from curl_cffi import requests as curl_requests
-    except ImportError:
+    except Exception as e:  # noqa: BLE001 - ImportError or a broken native library
+        print(f"  - curl_cffi unavailable ({type(e).__name__}: {e}).")
         curl_requests = None
 
     if curl_requests is not None:
         rejected: List[str] = []
+        first_error = ""
         for candidate in _YF_IMPERSONATE_CANDIDATES:
             try:
                 trial = curl_requests.Session(impersonate=candidate)
@@ -117,17 +127,41 @@ def get_yfinance_session(probe_url: str = "https://fc.yahoo.com") -> Optional[An
             except Exception as e:  # noqa: BLE001 - classify by name across curl_cffi versions
                 if "Impersonat" in type(e).__name__ or "not supported" in str(e):
                     rejected.append(candidate)
+                    first_error = first_error or f"{type(e).__name__}: {e}"
                     continue
                 # Profile accepted; failure was ordinary network trouble (keep the profile)
             session, profile = trial, candidate
             break
         if rejected:
-            print(f"  - curl_cffi rejected browser profiles {rejected}; using '{profile}' for Yahoo Finance.")
-        if session is None:
-            warnings.warn("No curl_cffi browser profile works; falling back to yfinance's default session.", stacklevel=2)
+            print(f"  - curl_cffi rejected browser profiles {rejected}; first error: {first_error}")
+
+    if session is None:
+        try:
+            import requests
+
+            session = requests.Session()
+            session.headers["User-Agent"] = _BROWSER_USER_AGENT
+            profile = "requests (curl_cffi fallback)"
+        except ImportError:
+            session, profile = None, "yfinance default"
+    print(f"  - Yahoo Finance HTTP session: {profile}")
 
     _YF_SESSION_STATE.update(session=session, profile=profile)
     return session
+
+
+def _yf_download(**kwargs: Any) -> pd.DataFrame:
+    """
+    Calls yfinance's own download function (yfinance.multi.download), not the
+    `yf.download` attribute, so notebook monkey-patches of yf.download cannot wrap or
+    recurse into it. `session` is only passed when one exists.
+    """
+    from yfinance.multi import download as _download
+
+    session = get_yfinance_session()
+    if session is not None:
+        kwargs["session"] = session
+    return _download(**kwargs)
 
 
 def compute_split_index(n_rows: int, train_ratio: float = DEFAULT_TRAIN_RATIO) -> int:
@@ -198,8 +232,7 @@ class MarketDataProcessor:
         else:
             download_kwargs["period"] = period
 
-        session = get_yfinance_session()
-        df: pd.DataFrame = yf.download(**download_kwargs, session=session)
+        df: pd.DataFrame = _yf_download(**download_kwargs)
 
         if df.empty:
             raise ValueError(
