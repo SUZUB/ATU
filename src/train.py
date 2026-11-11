@@ -201,34 +201,18 @@ class LiveData:
     sentiment: Optional[pd.DataFrame]
 
 
-def build_live_state_vector(
-    ticker: str = "AAPL",
-    period: str = "60d",
-    interval: str = "5m",
-    data_dir: Optional[str] = None,
-    use_finbert: bool = True,
-    device: str = "auto",
-    news_queries: Optional[Sequence[str]] = None,
-    include_archive: bool = False,
-    require_sentiment: bool = False,
-) -> LiveData:
-    """
-    Downloads real candles and real headlines, scores headlines with FinBERT, and
-    merges them (one-day lag, exchange timezone). Raises if price data is unavailable;
-    never substitutes synthetic data. `include_archive` also scans the large 2009-2020
-    archive CSVs (off by default: they cannot overlap a recent 60-day window).
-    """
-    print(f"\n[Data 1/3] Downloading real {interval} candles for {ticker} (period={period})...")
-    market_processor = MarketDataProcessor()  # scaler fit on the first 80% only
-    market_df = market_processor.process(ticker=ticker, period=period, interval=interval)
-    exchange_tz = market_df.index.tz
-    bar_dates = pd.Series(market_df.index.date)
-    bars_per_day = int(bar_dates.value_counts().median())
-    market_start, market_end = bar_dates.min(), bar_dates.max()
-    print(f"  - {market_df.shape[0]:,} candles | {market_start} -> {market_end} | "
-          f"{bar_dates.nunique()} sessions | ~{bars_per_day} bars/day | tz={exchange_tz}")
-
-    print(f"\n[Data 2/3] Collecting real headlines for {ticker}...")
+def _score_recent_news(
+    ticker: str,
+    market_start: Any,
+    market_end: Any,
+    exchange_tz: Any,
+    data_dir: Optional[str],
+    use_finbert: bool,
+    device: str,
+    news_queries: Optional[Sequence[str]],
+    include_archive: bool,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """Fetches recent headlines and scores them with FinBERT. Returns (headlines, daily sentiment or None)."""
     news_start = pd.Timestamp(market_start) - pd.Timedelta(days=7)  # lagged sentiment for the first sessions
     cache_path = None
     if data_dir is not None:
@@ -252,16 +236,64 @@ def build_live_state_vector(
         except FileNotFoundError:
             pass
 
-    sentiment_df: Optional[pd.DataFrame] = None
     if headlines.empty:
         print("  - WARNING: no real headlines found for the market window -> neutral sentiment (0.0).")
-    elif not use_finbert:
+        return headlines, None
+    if not use_finbert:
         print("  - FinBERT disabled (--no-finbert) -> neutral sentiment (0.0).")
+        return headlines, None
+
+    sentiment_processor = SentimentProcessor(device=None if device == "auto" else device)
+    print(f"  - Scoring {len(headlines):,} headlines with FinBERT on {sentiment_processor.device.type.upper()}...")
+    sentiment_df = sentiment_processor.process_news_dataframe(headlines[["date", "headline"]], batch_size=32)
+    print(f"  - Daily sentiment: {len(sentiment_df):,} days | mean {sentiment_df['daily_sentiment'].mean():+.3f}")
+    return headlines, sentiment_df
+
+
+def build_live_state_vector(
+    ticker: str = "AAPL",
+    period: str = "60d",
+    interval: str = "5m",
+    data_dir: Optional[str] = None,
+    use_finbert: bool = True,
+    device: str = "auto",
+    news_queries: Optional[Sequence[str]] = None,
+    include_archive: bool = False,
+    require_sentiment: bool = False,
+    use_news: bool = True,
+) -> LiveData:
+    """
+    Downloads real candles and real headlines, scores headlines with FinBERT, and
+    merges them (one-day lag, exchange timezone). Raises if price data is unavailable;
+    never substitutes synthetic data. `include_archive` also scans the large 2009-2020
+    archive CSVs (off by default: they cannot overlap a recent 60-day window).
+    `use_news=False` skips news and FinBERT entirely (price data only, neutral sentiment).
+    Any failure in the optional news step degrades to neutral sentiment instead of raising.
+    """
+    print(f"\n[Data 1/3] Downloading real {interval} candles for {ticker} (period={period})...")
+    market_processor = MarketDataProcessor()  # scaler fit on the first 80% only
+    market_df = market_processor.process(ticker=ticker, period=period, interval=interval)
+    exchange_tz = market_df.index.tz
+    bar_dates = pd.Series(market_df.index.date)
+    bars_per_day = int(bar_dates.value_counts().median())
+    market_start, market_end = bar_dates.min(), bar_dates.max()
+    print(f"  - {market_df.shape[0]:,} candles | {market_start} -> {market_end} | "
+          f"{bar_dates.nunique()} sessions | ~{bars_per_day} bars/day | tz={exchange_tz}")
+
+    sentiment_df: Optional[pd.DataFrame] = None
+    headlines = pd.DataFrame(columns=["date", "headline"])
+    if not use_news:
+        print("\n[Data 2/3] News sentiment disabled (price data only) -> neutral sentiment (0.0).")
     else:
-        sentiment_processor = SentimentProcessor(device=None if device == "auto" else device)
-        print(f"  - Scoring {len(headlines):,} headlines with FinBERT on {sentiment_processor.device.type.upper()}...")
-        sentiment_df = sentiment_processor.process_news_dataframe(headlines[["date", "headline"]], batch_size=32)
-        print(f"  - Daily sentiment: {len(sentiment_df):,} days | mean {sentiment_df['daily_sentiment'].mean():+.3f}")
+        print(f"\n[Data 2/3] Collecting real headlines for {ticker}...")
+        try:
+            headlines, sentiment_df = _score_recent_news(
+                ticker, market_start, market_end, exchange_tz, data_dir,
+                use_finbert, device, news_queries, include_archive,
+            )
+        except Exception as e:  # news is optional: never let it stop the price pipeline
+            print(f"  - WARNING: news/sentiment step failed ({type(e).__name__}: {e}) -> neutral sentiment (0.0).")
+            sentiment_df = None
 
     print("\n[Data 3/3] Merging into final_state_vector (sentiment lagged 1 day, expires after 4)...")
     final_state_vector = create_final_state_vector(market_df, sentiment_df)
@@ -581,6 +613,7 @@ def run_pipeline(
     tensorboard: bool = True,
     require_sentiment: bool = False,
     include_archive: bool = False,
+    use_news: bool = True,
 ) -> Tuple[Dict[str, BaseAlgorithm], BacktestResult]:
     """Same steps as ATU_GPU.ipynb cells 3-4. `total_timesteps` is per agent."""
     print("=" * 70)
@@ -591,7 +624,7 @@ def run_pipeline(
         ticker=ticker, period=period,
         data_dir=str(data_dir) if data_dir else str(paths.datasets),
         use_finbert=use_finbert, device=device, news_queries=news_queries,
-        require_sentiment=require_sentiment, include_archive=include_archive,
+        require_sentiment=require_sentiment, include_archive=include_archive, use_news=use_news,
     )
     train_df, test_df = split_train_test(data.final_state_vector, data.market_processor)
     steps_per_chunk = max(1, math.ceil(total_timesteps / chunks))
@@ -624,6 +657,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--data-dir", default=None, help="Headline cache/archive folder (default: <workspace>/datasets)")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="FinBERT device")
     parser.add_argument("--no-finbert", dest="finbert", action="store_false", help="Skip FinBERT (neutral sentiment)")
+    parser.add_argument("--no-news", dest="news", action="store_false",
+                        help="Price data only: skip news fetching and FinBERT entirely")
     parser.add_argument("--news-query", action="append", default=None,
                         help="Override news search query (repeatable). Default: '<company> stock', '<symbol> stock'")
     parser.add_argument("--require-sentiment", action="store_true", help="Fail if no bar receives real sentiment")
@@ -646,6 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tensorboard=args.tensorboard,
         require_sentiment=args.require_sentiment,
         include_archive=args.include_archive,
+        use_news=args.news,
     )
 
 

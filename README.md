@@ -108,6 +108,7 @@ Key CLI options (`python train_and_backtest.py --help`):
 | `--device` | `auto` | FinBERT device |
 | `--news-query` | company + symbol | Override news search queries (repeatable) |
 | `--no-finbert` | off | Neutral sentiment |
+| `--no-news` | off | Price data only: skip news fetching and FinBERT (notebook: `USE_NEWS_SENTIMENT = False`) |
 | `--require-sentiment` | off | Fail if no bar gets real sentiment |
 | `--include-archive` | off | Also scan old archive CSVs in `datasets/` |
 | `--no-tensorboard` | off | Disable TensorBoard logs |
