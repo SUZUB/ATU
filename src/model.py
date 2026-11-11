@@ -6,12 +6,11 @@ Reinforcement Learning Environment & Model Definitions.
 Components:
 -----------
 1. ConstrainedTradingEnv (File 3):
-   - Gymnasium rules engine with Continuous Compounding.
-   - Day-Lock Stop-Loss (-1% threshold with slippage penalty).
-   - MIS 15:15 Auto-Square-Off without premature termination.
-   - 3-Trade Daily Quota & Overtrading Penalty (-0.1).
-   - Round-trip Brokerage & STT transaction fees (0.05% entry + 0.05% exit).
-   - Dynamic 1% risk manager scaling against live `account_balance`.
+   - Gymnasium rules engine with continuous compounding on raw (unscaled) prices.
+   - Discrete(3) actions (0 short, 1 flat, 2 long); reward = net rupee P&L per step.
+   - Stop-loss at -1% with intra-candle and gap-slippage fills, day lockout after a stop.
+   - Session square-off (15:15 IST for NSE MIS) without terminating the episode.
+   - 3-trade daily cap; 0.03% brokerage per leg (entry + exit).
 2. create_trading_env:
    - Helper to instantiate and validate the Gymnasium environment.
 3. create_ppo_agent:

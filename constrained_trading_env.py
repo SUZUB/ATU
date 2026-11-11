@@ -10,9 +10,13 @@ Design (v4):
    P&L, account balance and stop-loss checks use the UNSCALED close price
    (`raw_close` column). Scaled features are used only for the observation.
 2. Discrete execution:
-   action > +threshold -> target Long (+1); action < -threshold -> target Short (-1);
-   otherwise -> Flat (0). Position size is fixed at entry and never resized while
-   held. Brokerage is charged only on entry and exit legs (a flip = exit + entry).
+   Default action space is Discrete(3): 0 = Short, 1 = Flat, 2 = Long. Every choice
+   gets equal exploration, which prevents the "always one direction" collapse seen
+   with a clipped Gaussian on Box(-1, 1), where the flat band |a| <= 0.1 was almost
+   never sampled. `discrete_actions=False` restores the legacy Box(-1, 1) interface
+   (action > +threshold -> Long, < -threshold -> Short, else Flat).
+   Position size is fixed at entry and never resized while held. Brokerage is
+   charged only on entry and exit legs (a flip = exit + entry).
 3. Reward = net profit of the step in currency:
    (equity after step) - (equity before step), where equity = cash + mark-to-market
    of the open position. Fees are already deducted from cash, so they are included.
@@ -24,9 +28,11 @@ Design (v4):
    - Max `max_daily_trades` entries per calendar day.
    - Stop-loss: the stop price is entry * (1 + loss_limit) for longs and
      entry * (1 - loss_limit) for shorts. If the next candle's raw low (long) or raw
-     high (short) breaches it, the position is closed EXACTLY at the stop price and the
-     agent is locked out for the rest of the day. Without `raw_high`/`raw_low` columns
-     the check falls back to the close price.
+     high (short) breaches it, the position is closed at the stop price and the agent is
+     locked out for the rest of the day. Gap slippage: if that candle's raw open is
+     already strictly beyond the stop (below it for a long, above it for a short), the
+     fill is the raw open instead. Without `raw_high`/`raw_low` the breach check uses
+     the close; without `raw_open` the fill is the stop price.
    - 15:15 MIS square-off: positions are closed on the first bar at/after 15:15; no
      new entries until the next session.
    - Positions are never carried overnight (safety close on date rollover).
@@ -50,6 +56,7 @@ import pandas as pd
 RAW_PRICE_COLUMN: str = "raw_close"
 RAW_HIGH_COLUMN: str = "raw_high"
 RAW_LOW_COLUMN: str = "raw_low"
+RAW_OPEN_COLUMN: str = "raw_open"
 
 
 def _seconds(t: time) -> int:
@@ -59,7 +66,8 @@ def _seconds(t: time) -> int:
 class ConstrainedTradingEnv(gym.Env):
     """
     Action Space:
-        Box(-1.0, 1.0, shape=(1,)), interpreted as a discrete target position.
+        Discrete(3): 0 = Short, 1 = Flat, 2 = Long (target position).
+        Legacy (discrete_actions=False): Box(-1.0, 1.0, shape=(1,)).
 
     Observation Space:
         Box(num_features + 5,):
@@ -95,9 +103,11 @@ class ConstrainedTradingEnv(gym.Env):
         raw_price_col: str = RAW_PRICE_COLUMN,
         raw_high_col: str = RAW_HIGH_COLUMN,
         raw_low_col: str = RAW_LOW_COLUMN,
+        raw_open_col: str = RAW_OPEN_COLUMN,
         session_start_time: time = time(9, 15, 0),
         session_end_time: time = time(15, 30, 0),
         action_threshold: float = 0.1,
+        discrete_actions: bool = True,
     ) -> None:
         """
         Args:
@@ -115,8 +125,11 @@ class ConstrainedTradingEnv(gym.Env):
             raw_price_col: Column holding unscaled close prices (excluded from observations).
             raw_high_col / raw_low_col: Optional unscaled high/low columns used for
                 intra-candle stop-loss detection (excluded from observations).
+            raw_open_col: Optional unscaled open column used for gap-slippage stop fills
+                (excluded from observations).
             session_start_time / session_end_time: Session bounds for `time_of_day`.
-            action_threshold: |action| above this opens/holds a directional position.
+            action_threshold: Legacy Box mode only: |action| above this is directional.
+            discrete_actions: True (default) -> Discrete(3) actions; False -> Box(-1, 1).
         """
         super().__init__()
 
@@ -147,6 +160,7 @@ class ConstrainedTradingEnv(gym.Env):
         self.max_daily_trades: int = int(max_daily_trades)
         self.auto_square_off_time: time = auto_square_off_time
         self.action_threshold: float = float(action_threshold)
+        self.discrete_actions: bool = bool(discrete_actions)
         self._session_start_s: int = _seconds(session_start_time)
         self._session_len_s: int = _seconds(session_end_time) - self._session_start_s
 
@@ -187,9 +201,16 @@ class ConstrainedTradingEnv(gym.Env):
                 if not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
                     raise ValueError(f"'{name}' must contain strictly positive, finite, UNSCALED prices.")
 
+        # Optional unscaled open for gap-slippage stop fills
+        self.opens: Optional[np.ndarray] = None
+        if raw_open_col in self.df.columns:
+            self.opens = self.df[raw_open_col].to_numpy(dtype=np.float64)
+            if not np.all(np.isfinite(self.opens)) or np.any(self.opens <= 0.0):
+                raise ValueError(f"'{raw_open_col}' must contain strictly positive, finite, UNSCALED prices.")
+
         # Observation features: all numeric columns except the dedicated raw price columns
         numeric_df = self.df.select_dtypes(include=[np.number])
-        excluded = [raw_high_col, raw_low_col]
+        excluded = [raw_high_col, raw_low_col, raw_open_col]
         if self.raw_price_col == raw_price_col:
             excluded.append(self.raw_price_col)
         numeric_df = numeric_df.drop(columns=[c for c in excluded if c in numeric_df.columns])
@@ -198,7 +219,11 @@ class ConstrainedTradingEnv(gym.Env):
         self.num_rows: int = len(self.df)
         self.num_features: int = self.features.shape[1]
 
-        self.action_space: spaces.Box = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.action_space: spaces.Space = (
+            spaces.Discrete(3)
+            if self.discrete_actions
+            else spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        )
         self.observation_space: spaces.Box = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -281,10 +306,14 @@ class ConstrainedTradingEnv(gym.Env):
         )
         return np.concatenate([self.features[self.current_step], state]).astype(np.float32)
 
-    def _action_to_target(self, action: Union[float, np.ndarray]) -> Tuple[float, int]:
+    def _action_to_target(self, action: Union[int, float, np.ndarray]) -> Tuple[float, int]:
+        """Returns (signal in [-1, 1], target direction in {-1, 0, 1})."""
         act_val = float(np.asarray(action, dtype=np.float64).reshape(-1)[0])
         if not np.isfinite(act_val):
-            act_val = 0.0
+            act_val = 1.0 if self.discrete_actions else 0.0
+        if self.discrete_actions:
+            target = int(np.clip(round(act_val), 0, 2)) - 1  # 0 short, 1 flat, 2 long
+            return float(target), target
         act_val = float(np.clip(act_val, -1.0, 1.0))
         if act_val > self.action_threshold:
             return act_val, 1
@@ -346,6 +375,18 @@ class ConstrainedTradingEnv(gym.Env):
             return high >= self.stop_price
         return False
 
+    def _stop_fill_price(self, idx: int) -> float:
+        """Stop price, or the candle's open when the candle gapped strictly through the stop."""
+        stop = self.stop_price
+        if self.opens is None:
+            return stop
+        candle_open = float(self.opens[idx])
+        if self.position_direction == 1 and candle_open < stop:
+            return candle_open
+        if self.position_direction == -1 and candle_open > stop:
+            return candle_open
+        return stop
+
     def _mark_to_market(self, price: float) -> None:
         if self.is_active_position:
             self.unrealized_pnl = self.position_direction * self.shares * (price - self.entry_price)
@@ -403,8 +444,8 @@ class ConstrainedTradingEnv(gym.Env):
                 # Safety: never carry an intraday position overnight
                 closed_trade_pnls.append(self._close_position(price_next))
             elif self._stop_breached(self.current_step):
-                # Exit exactly at the stop price: loss is capped at |loss_limit| + fees
-                closed_trade_pnls.append(self._close_position(self.stop_price))
+                # Exit at the stop price, or at the open if the candle gapped through it
+                closed_trade_pnls.append(self._close_position(self._stop_fill_price(self.current_step)))
                 stop_loss_hit = True
                 self.locked_out_for_day = True
             elif next_ts.time() >= self.auto_square_off_time:
@@ -514,7 +555,7 @@ if __name__ == "__main__":
     total_reward = 0.0
     step_idx = 0
     while not done:
-        action = np.array([0.9 if (step_idx // 20) % 2 == 0 else 0.0])
+        action = 2 if (step_idx // 20) % 2 == 0 else 1  # alternate Long / Flat
         obs, reward, terminated, truncated, step_info = env.step(action)
         total_reward += reward
         done = terminated or truncated

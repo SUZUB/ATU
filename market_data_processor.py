@@ -17,12 +17,28 @@ Look-ahead protections:
 
 Raw prices:
 -----------
-Unscaled close/high/low prices are preserved in `raw_close`, `raw_high` and
-`raw_low`. The trading environment uses them for P&L, balance and intra-candle
-stop-loss fills, and excludes them from the agent's observation.
+Unscaled open/high/low/close prices are preserved in `raw_open`, `raw_high`,
+`raw_low` and `raw_close`. The trading environment uses them for P&L, balance and
+stop-loss fills (including gap slippage), and excludes them from the observation.
+
+Recent news:
+------------
+`fetch_recent_headlines()` pulls free, recent headlines (Google News RSS searched in
+date windows + yfinance `get_news`) so FinBERT sentiment covers the same 60-day
+window as yfinance 5-minute candles. Headline dates are taken in the EXCHANGE's
+local timezone before the one-day sentiment lag is applied.
 """
 
-from typing import List, Optional, Union
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+import re
+import time
+from typing import Any, Dict, List, Optional, Sequence, Union
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
@@ -38,7 +54,13 @@ from ta.volatility import AverageTrueRange, BollingerBands
 RAW_PRICE_COLUMN: str = "raw_close"
 RAW_HIGH_COLUMN: str = "raw_high"
 RAW_LOW_COLUMN: str = "raw_low"
-RAW_PRICE_SOURCES = {RAW_PRICE_COLUMN: "Close", RAW_HIGH_COLUMN: "High", RAW_LOW_COLUMN: "Low"}
+RAW_OPEN_COLUMN: str = "raw_open"
+RAW_PRICE_SOURCES = {
+    RAW_PRICE_COLUMN: "Close",
+    RAW_HIGH_COLUMN: "High",
+    RAW_LOW_COLUMN: "Low",
+    RAW_OPEN_COLUMN: "Open",
+}
 
 # Columns MinMax-scaled to [0, 1] using statistics from the training slice only.
 DEFAULT_SCALE_COLUMNS: List[str] = [
@@ -209,7 +231,7 @@ class MarketDataProcessor:
         """
         Leak-free normalization.
 
-        - Preserves unscaled close/high/low in `raw_close`/`raw_high`/`raw_low`
+        - Preserves unscaled OHLC in `raw_open`/`raw_high`/`raw_low`/`raw_close`
           (for environment P&L and stop-loss fills).
         - fit_scaler=True: fits the MinMaxScaler on rows [0, split_index) ONLY,
           then transforms ALL rows (train + test) with that fitted scaler.
@@ -373,6 +395,217 @@ def create_final_state_vector(
 
     final_df["daily_sentiment"] = aligned["daily_sentiment"].fillna(0.0).to_numpy(dtype=np.float64)
     return final_df
+
+
+# =====================================================================
+# Recent news headlines (free sources) for FinBERT
+# =====================================================================
+NEWS_COLUMNS: List[str] = ["date", "headline", "source", "published"]
+_USER_AGENT = "Mozilla/5.0 (compatible; ATU-news-fetcher/1.0)"
+_COMPANY_SUFFIX = re.compile(
+    r"[\s,]+(inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|plc|co\.?|company|n\.?v\.?|s\.?a\.?|ag)$",
+    re.IGNORECASE,
+)
+
+
+def is_indian_ticker(ticker: str) -> bool:
+    return ticker.upper().endswith((".NS", ".BO"))
+
+
+def lookup_company_name(ticker: str) -> Optional[str]:
+    """Company name without legal suffixes (e.g. 'Apple Inc.' -> 'Apple'), or None if unavailable."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return None
+    name = str(info.get("longName") or info.get("shortName") or "").strip()
+    previous = None
+    while name and previous != name:
+        previous = name
+        name = _COMPANY_SUFFIX.sub("", name).strip()
+    return name or None
+
+
+def _to_utc(value: Any) -> Optional[pd.Timestamp]:
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _naive_day(value: Union[str, pd.Timestamp]) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    return (ts.tz_localize(None) if ts.tzinfo is not None else ts).normalize()
+
+
+def _fetch_yfinance_news(ticker: str, count: int = 100) -> List[Dict[str, Any]]:
+    """Most recent headlines from Yahoo Finance (typically only the last few days)."""
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        try:
+            items = yf_ticker.get_news(count=count)
+        except TypeError:  # older yfinance without `count`
+            items = yf_ticker.news
+    except Exception as e:
+        warnings.warn(f"yfinance news fetch failed for {ticker}: {e}", stacklevel=2)
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for item in items or []:
+        content = item.get("content", item) if isinstance(item, dict) else {}
+        title = str(content.get("title") or "").strip()
+        published = content.get("pubDate") or content.get("displayTime")
+        if published is None and item.get("providerPublishTime"):
+            published = pd.Timestamp(item["providerPublishTime"], unit="s", tz="UTC")
+        published = _to_utc(published)
+        if title and published is not None:
+            rows.append({"headline": title, "published": published, "source": "yfinance"})
+    return rows
+
+
+def _fetch_google_news_rss(
+    query: str,
+    window_start: pd.Timestamp,
+    window_end_exclusive: pd.Timestamp,
+    country: str = "US",
+    timeout: float = 15.0,
+) -> List[Dict[str, Any]]:
+    """Google News RSS search restricted to [window_start, window_end_exclusive)."""
+    search = f"{query} after:{window_start:%Y-%m-%d} before:{window_end_exclusive:%Y-%m-%d}"
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{urllib.parse.quote(search)}&hl=en-{country}&gl={country}&ceid={country}:en"
+    )
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        root = ET.fromstring(response.read())
+
+    rows: List[Dict[str, Any]] = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        publisher = (item.findtext("source") or "").strip()
+        if publisher and title.endswith(f" - {publisher}"):
+            title = title[: -len(publisher) - 3].strip()
+        try:
+            published = _to_utc(parsedate_to_datetime(item.findtext("pubDate") or ""))
+        except (TypeError, ValueError):
+            published = None
+        if title and published is not None:
+            rows.append({"headline": title, "published": published, "source": "google_news"})
+    return rows
+
+
+def _read_news_cache(cache_path: Optional[Path]) -> pd.DataFrame:
+    if cache_path is None or not cache_path.exists():
+        return pd.DataFrame(columns=["headline", "published", "source"])
+    cached = pd.read_csv(cache_path)
+    cached["published"] = pd.to_datetime(cached["published"], utc=True, errors="coerce")
+    return cached.dropna(subset=["headline", "published"])
+
+
+def fetch_recent_headlines(
+    ticker: str,
+    start: Union[str, pd.Timestamp],
+    end: Union[str, pd.Timestamp],
+    tz: Optional[Any] = None,
+    queries: Optional[Sequence[str]] = None,
+    window_days: int = 3,
+    use_google_news: bool = True,
+    use_yfinance: bool = True,
+    cache_path: Optional[Union[str, Path]] = None,
+    request_pause: float = 0.5,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetches real recent headlines for `ticker` between `start` and `end` (inclusive dates).
+
+    Sources:
+      - Google News RSS, searched in `window_days` windows so coverage spans the whole
+        range (each RSS query returns at most ~100 items).
+      - yfinance `get_news` (only the most recent days, but finer timestamps).
+
+    Dates are assigned in `tz` (pass the exchange timezone, e.g. market_df.index.tz) so
+    that the downstream one-day lag maps e.g. Tuesday post-market news to Wednesday.
+    When `cache_path` is given, headlines are accumulated there and later runs only
+    re-fetch from shortly before the newest cached headline.
+
+    Returns:
+        DataFrame with columns ['date', 'headline', 'source', 'published'] sorted by time.
+    """
+    start_day, end_day = _naive_day(start), _naive_day(end)
+    if end_day < start_day:
+        raise ValueError(f"end ({end_day.date()}) is before start ({start_day.date()})")
+
+    if queries is None:
+        base_symbol = ticker.split(".")[0].upper()
+        company = lookup_company_name(ticker)
+        queries = [f"{company} stock"] if company else []
+        queries.append(f"{base_symbol} stock")
+    queries = list(dict.fromkeys(q for q in queries if q and q.strip()))
+    country = "IN" if is_indian_ticker(ticker) else "US"
+
+    cache_file = Path(cache_path) if cache_path is not None else None
+    cached = _read_news_cache(cache_file)
+    fetch_from = start_day
+    if not cached.empty:
+        cached_days = cached["published"].dt.tz_convert(None).dt.normalize()
+        if cached_days.min() <= start_day + pd.Timedelta(days=3):
+            fetch_from = max(start_day, cached_days.max() - pd.Timedelta(days=2))
+
+    rows: List[Dict[str, Any]] = []
+    failures = 0
+    requests_made = 0
+    if use_google_news:
+        window_start = fetch_from
+        while window_start <= end_day:
+            window_end_exclusive = window_start + pd.Timedelta(days=window_days + 1)  # 1-day overlap
+            for query in queries:
+                try:
+                    rows.extend(_fetch_google_news_rss(query, window_start, window_end_exclusive, country))
+                except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError) as e:
+                    failures += 1
+                    if failures <= 3:
+                        warnings.warn(f"Google News RSS request failed ({query!r}, {window_start.date()}): {e}", stacklevel=2)
+                requests_made += 1
+                time.sleep(request_pause)
+            window_start += pd.Timedelta(days=window_days)
+    if use_yfinance:
+        rows.extend(_fetch_yfinance_news(ticker))
+
+    fresh = pd.DataFrame(rows, columns=["headline", "published", "source"])
+    combined = pd.concat([cached, fresh], ignore_index=True) if not cached.empty else fresh
+    if combined.empty:
+        if verbose:
+            print(f"  - News fetch: 0 headlines ({requests_made} RSS requests, {failures} failed)")
+        return pd.DataFrame(columns=NEWS_COLUMNS)
+
+    combined["published"] = pd.to_datetime(combined["published"], utc=True)
+    combined["_key"] = combined["headline"].str.lower().str.replace(r"\W+", " ", regex=True).str.strip()
+    combined = (
+        combined.sort_values("published")
+        .drop_duplicates(subset="_key", keep="first")  # earliest publication wins
+        .drop(columns="_key")
+        .reset_index(drop=True)
+    )
+
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        combined.assign(published=combined["published"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")).to_csv(cache_file, index=False)
+
+    local_time = combined["published"].dt.tz_convert(tz) if tz is not None else combined["published"]
+    combined["date"] = local_time.dt.strftime("%Y-%m-%d")
+    local_day = pd.to_datetime(combined["date"])
+    result = combined[(local_day >= start_day) & (local_day <= end_day)][NEWS_COLUMNS].reset_index(drop=True)
+
+    if verbose:
+        print(
+            f"  - News fetch: {len(result):,} unique headlines over {result['date'].nunique()} days "
+            f"({requests_made} RSS requests, {failures} failed; queries={queries})"
+        )
+    return result
 
 
 if __name__ == "__main__":

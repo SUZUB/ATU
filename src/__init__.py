@@ -1,19 +1,7 @@
 """
-Trading Project Source Package
-==============================
-Modular reinforcement learning trading system with FinBERT sentiment and MIS friction modeling.
+ATU source package.
+
+Intentionally free of imports: eagerly importing `src.train` here made
+`python -m src.train` emit a RuntimeWarning (module already in sys.modules before
+execution). Import submodules directly, e.g. `from src.train import run_pipeline`.
 """
-
-from src.data_processing import MarketDataProcessor, SentimentProcessor, create_final_state_vector
-from src.model import ConstrainedTradingEnv, create_ppo_agent
-from src.train import run_pipeline
-
-__all__ = [
-    "MarketDataProcessor",
-    "SentimentProcessor",
-    "create_final_state_vector",
-    "ConstrainedTradingEnv",
-    "create_ppo_agent",
-    "run_pipeline",
-]
-

@@ -22,10 +22,8 @@ from pathlib import Path
 from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
 try:
+    from sentiment_processor import SentimentProcessor
     from market_data_processor import (
         MarketDataProcessor,
         RAW_PRICE_COLUMN,
@@ -35,6 +33,7 @@ try:
 except ImportError:
     import sys
     sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from sentiment_processor import SentimentProcessor
     from market_data_processor import (
         MarketDataProcessor,
         RAW_PRICE_COLUMN,
@@ -51,112 +50,8 @@ except ImportError:
 
 
 # =====================================================================
-# File 2: SentimentProcessor
+# File 2: SentimentProcessor (single source of truth: root sentiment_processor.py)
 # =====================================================================
-class SentimentProcessor:
-    """
-    Analyzes financial news headlines using the ProsusAI/finbert model with CUDA/CPU support.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "ProsusAI/finbert",
-        device: Optional[Union[str, torch.device]] = None,
-        max_length: int = 128,
-    ) -> None:
-        if device is not None:
-            self.device = torch.device(device)
-        else:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.model_name: str = model_name
-        self.max_length: int = max_length
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-        self.model.to(self.device)
-        self.model.eval()
-
-        label2id = {k.lower(): v for k, v in self.model.config.label2id.items()}
-        self.pos_idx: int = label2id.get("positive", 0)
-        self.neg_idx: int = label2id.get("negative", 1)
-        self.neu_idx: int = label2id.get("neutral", 2)
-
-    def get_sentiment_score(self, text: str) -> float:
-        """
-        Computes continuous sentiment score in [-1.0, 1.0]: P(positive) - P(negative).
-        """
-        if not isinstance(text, str) or not text.strip():
-            return 0.0
-
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=self.max_length,
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            probabilities = torch.softmax(outputs.logits, dim=-1)
-
-        prob_pos = probabilities[0, self.pos_idx].item()
-        prob_neg = probabilities[0, self.neg_idx].item()
-        score = prob_pos - prob_neg
-        return float(np.clip(score, -1.0, 1.0))
-
-    def process_news_dataframe(
-        self,
-        df: pd.DataFrame,
-        batch_size: Optional[int] = 32,
-    ) -> pd.DataFrame:
-        """
-        Processes financial headlines and calculates daily average sentiment scores.
-        """
-        required_cols = {"date", "headline"}
-        if not required_cols.issubset(df.columns):
-            raise KeyError(f"DataFrame must contain columns {required_cols}. Found: {list(df.columns)}")
-
-        if df.empty:
-            return pd.DataFrame(columns=["date", "daily_sentiment"])
-
-        news_df = df.copy()
-        news_df["date"] = pd.to_datetime(news_df["date"]).dt.strftime("%Y-%m-%d")
-
-        texts = news_df["headline"].astype(str).tolist()
-        scores: List[float] = []
-
-        # Batched inference for performance
-        bs = batch_size if batch_size is not None and batch_size > 1 else 1
-        for i in range(0, len(texts), bs):
-            batch_texts = [t if isinstance(t, str) and t.strip() else "" for t in texts[i : i + bs]]
-            inputs = self.tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=self.max_length,
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                probabilities = torch.softmax(outputs.logits, dim=-1)
-
-            prob_pos = probabilities[:, self.pos_idx].cpu().numpy()
-            prob_neg = probabilities[:, self.neg_idx].cpu().numpy()
-            scores.extend(np.clip(prob_pos - prob_neg, -1.0, 1.0).tolist())
-
-        news_df["sentiment_score"] = scores
-
-        daily_sentiment_df = (
-            news_df.groupby("date", as_index=False)["sentiment_score"]
-            .mean()
-            .rename(columns={"sentiment_score": "daily_sentiment"})
-            .sort_values(by="date")
-            .reset_index(drop=True)
-        )
-        return daily_sentiment_df
 
 
 # =====================================================================

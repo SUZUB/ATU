@@ -118,7 +118,7 @@ class SentimentProcessor:
     def process_news_dataframe(
         self,
         df: pd.DataFrame,
-        batch_size: Optional[int] = None,
+        batch_size: Optional[int] = 32,
     ) -> pd.DataFrame:
         """
         Processes a DataFrame of financial headlines, scores each headline's sentiment,
@@ -133,8 +133,8 @@ class SentimentProcessor:
 
         Args:
             df: Input pandas DataFrame containing 'date' and 'headline' columns.
-            batch_size: Optional mini-batch size for GPU inference. If None or 1,
-                        directly applies `get_sentiment_score` per headline.
+            batch_size: Mini-batch size for inference (default 32). If None or 1,
+                        applies `get_sentiment_score` per headline.
 
         Returns:
             pd.DataFrame: Clean DataFrame with columns ['date', 'daily_sentiment'],
