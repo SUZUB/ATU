@@ -22,8 +22,11 @@ Design (v4):
    stop-loss hit loses ~max_risk_per_trade of equity (defaults: 1% / 1% -> 1.0x).
 5. Rules:
    - Max `max_daily_trades` entries per calendar day.
-   - Stop-loss: when the open position's price move reaches `loss_limit` (-1%), it is
-     closed at that bar's close and the agent is locked out for the rest of the day.
+   - Stop-loss: the stop price is entry * (1 + loss_limit) for longs and
+     entry * (1 - loss_limit) for shorts. If the next candle's raw low (long) or raw
+     high (short) breaches it, the position is closed EXACTLY at the stop price and the
+     agent is locked out for the rest of the day. Without `raw_high`/`raw_low` columns
+     the check falls back to the close price.
    - 15:15 MIS square-off: positions are closed on the first bar at/after 15:15; no
      new entries until the next session.
    - Positions are never carried overnight (safety close on date rollover).
@@ -45,6 +48,8 @@ import pandas as pd
 
 
 RAW_PRICE_COLUMN: str = "raw_close"
+RAW_HIGH_COLUMN: str = "raw_high"
+RAW_LOW_COLUMN: str = "raw_low"
 
 
 def _seconds(t: time) -> int:
@@ -88,6 +93,8 @@ class ConstrainedTradingEnv(gym.Env):
         auto_square_off_time: time = time(15, 15, 0),
         price_col: str = "Close",
         raw_price_col: str = RAW_PRICE_COLUMN,
+        raw_high_col: str = RAW_HIGH_COLUMN,
+        raw_low_col: str = RAW_LOW_COLUMN,
         session_start_time: time = time(9, 15, 0),
         session_end_time: time = time(15, 30, 0),
         action_threshold: float = 0.1,
@@ -106,6 +113,8 @@ class ConstrainedTradingEnv(gym.Env):
             auto_square_off_time: MIS cut-off time.
             price_col: Fallback price column if `raw_price_col` is absent.
             raw_price_col: Column holding unscaled close prices (excluded from observations).
+            raw_high_col / raw_low_col: Optional unscaled high/low columns used for
+                intra-candle stop-loss detection (excluded from observations).
             session_start_time / session_end_time: Session bounds for `time_of_day`.
             action_threshold: |action| above this opens/holds a directional position.
         """
@@ -168,10 +177,22 @@ class ConstrainedTradingEnv(gym.Env):
                 "UNSCALED prices. MinMax-scaled prices (which reach 0.0) produce meaningless returns."
             )
 
-        # Observation features: all numeric columns except the dedicated raw price column
+        # Optional unscaled high/low for intra-candle stop-loss detection
+        self.highs: Optional[np.ndarray] = None
+        self.lows: Optional[np.ndarray] = None
+        if raw_high_col in self.df.columns and raw_low_col in self.df.columns:
+            self.highs = self.df[raw_high_col].to_numpy(dtype=np.float64)
+            self.lows = self.df[raw_low_col].to_numpy(dtype=np.float64)
+            for name, arr in ((raw_high_col, self.highs), (raw_low_col, self.lows)):
+                if not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
+                    raise ValueError(f"'{name}' must contain strictly positive, finite, UNSCALED prices.")
+
+        # Observation features: all numeric columns except the dedicated raw price columns
         numeric_df = self.df.select_dtypes(include=[np.number])
+        excluded = [raw_high_col, raw_low_col]
         if self.raw_price_col == raw_price_col:
-            numeric_df = numeric_df.drop(columns=[self.raw_price_col])
+            excluded.append(self.raw_price_col)
+        numeric_df = numeric_df.drop(columns=[c for c in excluded if c in numeric_df.columns])
         self.feature_columns: List[str] = list(numeric_df.columns)
         self.features: np.ndarray = numeric_df.to_numpy(dtype=np.float32)
         self.num_rows: int = len(self.df)
@@ -305,6 +326,26 @@ class ConstrainedTradingEnv(gym.Env):
         self._clear_position()
         return float(trade_net_pnl)
 
+    @property
+    def stop_price(self) -> float:
+        """Price at which the open position loses exactly |loss_limit| of its entry notional."""
+        if self.position_direction == 1:
+            return self.entry_price * (1.0 + self.loss_limit)
+        if self.position_direction == -1:
+            return self.entry_price * (1.0 - self.loss_limit)
+        return 0.0
+
+    def _stop_breached(self, idx: int) -> bool:
+        """True if candle `idx` traded through the stop price (intra-candle when high/low are known)."""
+        close = self.prices[idx]
+        if self.position_direction == 1:
+            low = min(close, self.lows[idx]) if self.lows is not None else close
+            return low <= self.stop_price
+        if self.position_direction == -1:
+            high = max(close, self.highs[idx]) if self.highs is not None else close
+            return high >= self.stop_price
+        return False
+
     def _mark_to_market(self, price: float) -> None:
         if self.is_active_position:
             self.unrealized_pnl = self.position_direction * self.shares * (price - self.entry_price)
@@ -361,8 +402,9 @@ class ConstrainedTradingEnv(gym.Env):
             if new_day:
                 # Safety: never carry an intraday position overnight
                 closed_trade_pnls.append(self._close_position(price_next))
-            elif self.unrealized_profit <= self.loss_limit:
-                closed_trade_pnls.append(self._close_position(price_next))
+            elif self._stop_breached(self.current_step):
+                # Exit exactly at the stop price: loss is capped at |loss_limit| + fees
+                closed_trade_pnls.append(self._close_position(self.stop_price))
                 stop_loss_hit = True
                 self.locked_out_for_day = True
             elif next_ts.time() >= self.auto_square_off_time:
@@ -457,6 +499,8 @@ if __name__ == "__main__":
             "RSI": np.random.uniform(0.3, 0.7, n_rows),
             "daily_sentiment": np.random.uniform(-0.5, 0.5, n_rows),
             RAW_PRICE_COLUMN: close_prices,
+            RAW_HIGH_COLUMN: close_prices * (1.0 + np.abs(np.random.normal(0, 0.002, n_rows))),
+            RAW_LOW_COLUMN: close_prices * (1.0 - np.abs(np.random.normal(0, 0.002, n_rows))),
         },
         index=pd.DatetimeIndex(timestamps),
     )

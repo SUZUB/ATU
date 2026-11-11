@@ -17,9 +17,9 @@ Look-ahead protections:
 
 Raw prices:
 -----------
-The unscaled close price is preserved in the `raw_close` column. The trading
-environment uses it for P&L, balance and stop-loss math and excludes it from the
-agent's observation.
+Unscaled close/high/low prices are preserved in `raw_close`, `raw_high` and
+`raw_low`. The trading environment uses them for P&L, balance and intra-candle
+stop-loss fills, and excludes them from the agent's observation.
 """
 
 from typing import List, Optional, Union
@@ -34,8 +34,11 @@ from ta.trend import ADXIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
 
 
-# Unscaled close price column consumed by ConstrainedTradingEnv for P&L math.
+# Unscaled price columns consumed by ConstrainedTradingEnv (P&L and stop-loss fills).
 RAW_PRICE_COLUMN: str = "raw_close"
+RAW_HIGH_COLUMN: str = "raw_high"
+RAW_LOW_COLUMN: str = "raw_low"
+RAW_PRICE_SOURCES = {RAW_PRICE_COLUMN: "Close", RAW_HIGH_COLUMN: "High", RAW_LOW_COLUMN: "Low"}
 
 # Columns MinMax-scaled to [0, 1] using statistics from the training slice only.
 DEFAULT_SCALE_COLUMNS: List[str] = [
@@ -206,7 +209,8 @@ class MarketDataProcessor:
         """
         Leak-free normalization.
 
-        - Preserves the unscaled close in `raw_close` (for environment P&L).
+        - Preserves unscaled close/high/low in `raw_close`/`raw_high`/`raw_low`
+          (for environment P&L and stop-loss fills).
         - fit_scaler=True: fits the MinMaxScaler on rows [0, split_index) ONLY,
           then transforms ALL rows (train + test) with that fitted scaler.
         - fit_scaler=False: transforms all rows with the previously fitted scaler
@@ -227,10 +231,11 @@ class MarketDataProcessor:
         normalized_df = df.copy()
 
         # Preserve unscaled prices before any transformation
-        if RAW_PRICE_COLUMN not in normalized_df.columns:
-            if "Close" not in normalized_df.columns:
-                raise KeyError("A 'Close' column is required to preserve raw prices.")
-            normalized_df[RAW_PRICE_COLUMN] = df["Close"].astype(np.float64)
+        if RAW_PRICE_COLUMN not in normalized_df.columns and "Close" not in normalized_df.columns:
+            raise KeyError("A 'Close' column is required to preserve raw prices.")
+        for raw_col, source_col in RAW_PRICE_SOURCES.items():
+            if raw_col not in normalized_df.columns and source_col in normalized_df.columns:
+                normalized_df[raw_col] = df[source_col].astype(np.float64)
 
         if fit_scaler:
             ratio = self.train_ratio if train_ratio is None else float(train_ratio)
@@ -302,20 +307,24 @@ def create_final_state_vector(
     market_df: pd.DataFrame,
     sentiment_df: Optional[pd.DataFrame] = None,
     sentiment_lag_days: int = 1,
+    max_staleness_days: Optional[int] = 4,
 ) -> pd.DataFrame:
     """
     Merges market features with daily FinBERT sentiment into `final_state_vector`.
 
     Sentiment dated D becomes available on calendar day D + `sentiment_lag_days`.
     Each bar receives the most recent sentiment that was available on or before its
-    own date (so Friday's news reaches Monday's bars). Bars with no prior sentiment
-    receive a neutral 0.0. Row count and order of `market_df` are preserved, so the
+    own date (so Friday's news reaches Monday's bars). Sentiment older than
+    `max_staleness_days` after it became available is dropped, so bars with no
+    recent sentiment receive a neutral 0.0 instead of a months-old score. Row count and order of `market_df` are preserved, so the
     chronological train/test split index is unchanged.
 
     Args:
         market_df: Output of MarketDataProcessor with a DatetimeIndex.
         sentiment_df: DataFrame with ['date', 'daily_sentiment'].
         sentiment_lag_days: Calendar-day delay before a day's sentiment is usable (default 1).
+        max_staleness_days: Max calendar days a score is carried forward after it becomes
+                            available (default 4, covers long weekends). None = unlimited.
     """
     if sentiment_lag_days < 0:
         raise ValueError("sentiment_lag_days must be >= 0")
@@ -359,6 +368,7 @@ def create_final_state_vector(
         left_on="_bar_date",
         right_on="_available_date",
         direction="backward",
+        tolerance=None if max_staleness_days is None else pd.Timedelta(days=int(max_staleness_days)),
     ).sort_values("_pos")
 
     final_df["daily_sentiment"] = aligned["daily_sentiment"].fillna(0.0).to_numpy(dtype=np.float64)
