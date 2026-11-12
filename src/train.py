@@ -80,6 +80,7 @@ AGENT_SPECS: Dict[str, Tuple[type, Dict[str, Any], str, str]] = {
 REWARD_CLIP: float = 10.0
 ACTION_SHORT, ACTION_FLAT, ACTION_LONG = 0, 1, 2  # ConstrainedTradingEnv Discrete(3)
 COLLAPSE_THRESHOLD: float = 0.95  # warn when one agent emits one signal on >95% of test bars
+ENTRY_CONFIDENCE: float = 0.5  # both agents must give the entry direction >= 50% probability
 
 
 def session_rules(ticker: str) -> Dict[str, dtime]:
@@ -515,6 +516,39 @@ def consensus_action(action_ppo: Any, action_a2c: Any) -> int:
     return a if a == b and a != ACTION_FLAT else ACTION_FLAT
 
 
+def action_probabilities(model: BaseAlgorithm, obs: np.ndarray) -> np.ndarray:
+    """Policy probabilities over [short, flat, long] for one observation."""
+    obs_tensor, _ = model.policy.obs_to_tensor(obs)
+    with torch.no_grad():
+        probs = model.policy.get_distribution(obs_tensor).distribution.probs
+    return probs.cpu().numpy().reshape(-1)
+
+
+def ensemble_decision(
+    probs_ppo: np.ndarray,
+    probs_a2c: np.ndarray,
+    position: int,
+    entry_confidence: float = ENTRY_CONFIDENCE,
+) -> int:
+    """
+    Confidence-gated entry with hold hysteresis.
+      Flat:       enter direction d only if BOTH agents' top choice is d and each gives
+                  d at least `entry_confidence` probability.
+      In a trade: keep it while at least one agent's top choice is still the held
+                  direction; exit to flat once neither supports it. (A flip happens via
+                  exit now + a fresh confident entry later.)
+    One bar of disagreement no longer closes a trade and pays fees.
+    """
+    top_ppo, top_a2c = int(np.argmax(probs_ppo)), int(np.argmax(probs_a2c))
+    if position != 0:
+        held = position + 1  # -1/1 -> action 0/2
+        return held if held in (top_ppo, top_a2c) else ACTION_FLAT
+    if top_ppo == top_a2c and top_ppo != ACTION_FLAT:
+        if min(float(probs_ppo[top_ppo]), float(probs_a2c[top_a2c])) >= entry_confidence:
+            return top_ppo
+    return ACTION_FLAT
+
+
 def signal_mix(actions: Sequence[int]) -> Dict[str, float]:
     """Share of short / flat / long signals."""
     arr = np.asarray(actions, dtype=int)
@@ -542,10 +576,12 @@ def run_ensemble_backtest(
     env_kwargs: Dict[str, Any],
     bars_per_day: int,
     ticker: str,
+    entry_confidence: float = ENTRY_CONFIDENCE,
 ) -> BacktestResult:
     """
     Runs the full test horizon on an UN-normalized env, so balances, fees and P&L are
     real rupees. Training used norm_obs=False, so agents consume raw observations.
+    Trades follow `ensemble_decision` (confident joint entries, hold while supported).
     Records each agent's signal mix and warns when a policy has collapsed to one signal.
     """
     test_env = ConstrainedTradingEnv(df=test_df, **env_kwargs)
@@ -564,11 +600,11 @@ def run_ensemble_backtest(
     step_info: Dict[str, Any] = info
     signals: Dict[str, List[int]] = {"PPO": [], "A2C": [], "Ensemble": []}
     while not done:
-        action_ppo, _ = models["PPO"].predict(state, deterministic=True)
-        action_a2c, _ = models["A2C"].predict(state, deterministic=True)
-        action = consensus_action(action_ppo, action_a2c)
-        signals["PPO"].append(int(np.asarray(action_ppo).reshape(-1)[0]))
-        signals["A2C"].append(int(np.asarray(action_a2c).reshape(-1)[0]))
+        probs_ppo = action_probabilities(models["PPO"], state)
+        probs_a2c = action_probabilities(models["A2C"], state)
+        action = ensemble_decision(probs_ppo, probs_a2c, test_env.position_direction, entry_confidence)
+        signals["PPO"].append(int(np.argmax(probs_ppo)))
+        signals["A2C"].append(int(np.argmax(probs_a2c)))
         signals["Ensemble"].append(action)
         state, _, terminated, truncated, step_info = test_env.step(action)
         done = terminated or truncated

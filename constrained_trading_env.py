@@ -33,6 +33,8 @@ Design (v4):
      already strictly beyond the stop (below it for a long, above it for a short), the
      fill is the raw open instead. Without `raw_high`/`raw_low` the breach check uses
      the close; without `raw_open` the fill is the stop price.
+   - Minimum holding period (`min_hold_bars`) and post-exit re-entry cooldown
+     (`reentry_cooldown_bars`) to stop fee-burning churn.
    - 15:15 MIS square-off: positions are closed on the first bar at/after 15:15; no
      new entries until the next session.
    - Positions are never carried overnight (safety close on date rollover).
@@ -41,7 +43,8 @@ Design (v4):
 Observation:
 ------------
 [market features (scaled; `raw_close` excluded)] +
-[unrealized_profit, current_position_direction, time_of_day, trades_remaining, locked_out_status]
+[unrealized_profit, current_position_direction, time_of_day, trades_remaining, locked_out_status,
+ action_blocked]
 """
 
 from datetime import time
@@ -70,13 +73,14 @@ class ConstrainedTradingEnv(gym.Env):
         Legacy (discrete_actions=False): Box(-1.0, 1.0, shape=(1,)).
 
     Observation Space:
-        Box(num_features + 5,):
+        Box(num_features + 6,):
             market features...,
             unrealized_profit          (fraction of entry notional, gross of fees),
             current_position_direction (-1, 0, 1),
             time_of_day                (fraction of session elapsed, 0..1),
             trades_remaining           (integer, 0..max_daily_trades),
-            locked_out_status          (0 or 1).
+            locked_out_status          (0 or 1),
+            action_blocked             (1 while a min-hold or re-entry cooldown blocks the agent).
     """
 
     metadata = {"render_modes": ["human"], "version": "4.0.0"}
@@ -87,6 +91,7 @@ class ConstrainedTradingEnv(gym.Env):
         "time_of_day",
         "trades_remaining",
         "locked_out_status",
+        "action_blocked",
     )
 
     def __init__(
@@ -108,6 +113,8 @@ class ConstrainedTradingEnv(gym.Env):
         session_end_time: time = time(15, 30, 0),
         action_threshold: float = 0.1,
         discrete_actions: bool = True,
+        min_hold_bars: int = 3,
+        reentry_cooldown_bars: int = 3,
     ) -> None:
         """
         Args:
@@ -130,6 +137,9 @@ class ConstrainedTradingEnv(gym.Env):
             session_start_time / session_end_time: Session bounds for `time_of_day`.
             action_threshold: Legacy Box mode only: |action| above this is directional.
             discrete_actions: True (default) -> Discrete(3) actions; False -> Box(-1, 1).
+            min_hold_bars: A position cannot be closed or flipped by the agent until it has
+                been held this many bars (stops, square-off and rollover still apply).
+            reentry_cooldown_bars: After any exit, no new entry for this many bars.
         """
         super().__init__()
 
@@ -161,6 +171,8 @@ class ConstrainedTradingEnv(gym.Env):
         self.auto_square_off_time: time = auto_square_off_time
         self.action_threshold: float = float(action_threshold)
         self.discrete_actions: bool = bool(discrete_actions)
+        self.min_hold_bars: int = max(0, int(min_hold_bars))
+        self.reentry_cooldown_bars: int = max(0, int(reentry_cooldown_bars))
         self._session_start_s: int = _seconds(session_start_time)
         self._session_len_s: int = _seconds(session_end_time) - self._session_start_s
 
@@ -248,6 +260,7 @@ class ConstrainedTradingEnv(gym.Env):
         self.total_fees_paid: float = 0.0
         self.locked_out_for_day: bool = False
         self.last_action: float = 0.0
+        self.bars_since_exit: int = 10**9  # no exit yet -> no cooldown
         self._clear_position()
 
     def _clear_position(self) -> None:
@@ -257,6 +270,7 @@ class ConstrainedTradingEnv(gym.Env):
         self.entry_notional: float = 0.0
         self.entry_fee: float = 0.0
         self.unrealized_pnl: float = 0.0  # currency, gross of fees
+        self.bars_held: int = 0
 
     @property
     def is_active_position(self) -> bool:
@@ -288,6 +302,16 @@ class ConstrainedTradingEnv(gym.Env):
     def trades_remaining(self) -> int:
         return max(0, self.max_daily_trades - self.daily_trades_count)
 
+    @property
+    def exit_blocked(self) -> bool:
+        """Agent-initiated exits are blocked during the minimum holding period."""
+        return self.is_active_position and self.bars_held < self.min_hold_bars
+
+    @property
+    def entry_blocked(self) -> bool:
+        """New entries are blocked during the post-exit cooldown."""
+        return not self.is_active_position and self.bars_since_exit < self.reentry_cooldown_bars
+
     def _time_of_day(self) -> float:
         t = self.dates[self.current_step].time()
         frac = (_seconds(t) - self._session_start_s) / self._session_len_s
@@ -301,6 +325,7 @@ class ConstrainedTradingEnv(gym.Env):
                 self._time_of_day(),
                 float(self.trades_remaining),
                 float(self.locked_out_for_day),
+                float(self.exit_blocked or self.entry_blocked),
             ],
             dtype=np.float32,
         )
@@ -337,6 +362,7 @@ class ConstrainedTradingEnv(gym.Env):
         self.entry_fee = float(fee)
         self.unrealized_pnl = 0.0
 
+        self.bars_held = 0
         self.daily_trades_count += 1
         self.total_trades += 1
 
@@ -353,6 +379,7 @@ class ConstrainedTradingEnv(gym.Env):
             self.winning_trades += 1
 
         self._clear_position()
+        self.bars_since_exit = 0
         return float(trade_net_pnl)
 
     @property
@@ -423,16 +450,29 @@ class ConstrainedTradingEnv(gym.Env):
         if self.locked_out_for_day or time_now >= self.auto_square_off_time:
             target = 0
 
+        forced_flat = self.locked_out_for_day or time_now >= self.auto_square_off_time
+        if self.exit_blocked and not forced_flat:
+            target = self.position_direction  # minimum holding period: keep the position
+
         # 2. Exit leg (close or first half of a flip)
         if self.is_active_position and target != self.position_direction:
             closed_trade_pnls.append(self._close_position(price_now))
 
-        # 3. Entry leg (subject to daily cap)
-        if target != 0 and not self.is_active_position and self.daily_trades_count < self.max_daily_trades:
+        # 3. Entry leg (subject to daily cap and post-exit cooldown)
+        if (
+            target != 0
+            and not self.is_active_position
+            and not self.entry_blocked
+            and self.daily_trades_count < self.max_daily_trades
+        ):
             self._open_position(target, price_now)
 
         # 4. Advance one bar and mark the position to market on raw prices
         self.current_step += 1
+        if self.is_active_position:
+            self.bars_held += 1
+        else:
+            self.bars_since_exit += 1
         price_next = float(self.prices[self.current_step])
         next_ts = self.dates[self.current_step]
         self._mark_to_market(price_next)
@@ -510,6 +550,9 @@ class ConstrainedTradingEnv(gym.Env):
             "trade_closed_profit": bool(any(p > 0.0 for p in closed_trade_pnls)),
             "stop_loss_hit": bool(stop_loss_hit),
             "locked_out_for_day": bool(self.locked_out_for_day),
+            "bars_held": int(self.bars_held),
+            "exit_blocked": bool(self.exit_blocked),
+            "entry_blocked": bool(self.entry_blocked),
             "days_processed": int(len(self.unique_dates_seen)),
         }
 
