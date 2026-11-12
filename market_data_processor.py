@@ -164,6 +164,22 @@ def _yf_download(**kwargs: Any) -> pd.DataFrame:
     return _download(**kwargs)
 
 
+def mirror_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Price-mirrored copy of an OHLCV frame for training augmentation: every log return is
+    negated (p' = p0^2 / p, with p0 the first close), so an uptrend becomes an identical
+    downtrend. High and Low swap roles; Volume is unchanged. An agent trained on both the
+    original and the mirror cannot profit from a fixed long or short bias.
+    """
+    pivot_sq = float(df["Close"].iloc[0]) ** 2
+    mirrored = df.copy()
+    mirrored["Open"] = pivot_sq / df["Open"]
+    mirrored["Close"] = pivot_sq / df["Close"]
+    mirrored["High"] = pivot_sq / df["Low"]
+    mirrored["Low"] = pivot_sq / df["High"]
+    return mirrored
+
+
 def compute_split_index(n_rows: int, train_ratio: float = DEFAULT_TRAIN_RATIO) -> int:
     """
     Chronological train/test boundary. Training pipelines MUST split with this

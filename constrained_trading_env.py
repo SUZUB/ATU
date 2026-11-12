@@ -42,7 +42,8 @@ Design (v4):
      (`reentry_cooldown_bars`) to stop fee-burning churn.
    - 15:15 MIS square-off: positions are closed on the first bar at/after 15:15; no
      new entries until the next session.
-   - Positions are never carried overnight (safety close on date rollover).
+   - Positions are closed at the close of each session's last bar (also covers 1h bars
+     and half-days) and never carried overnight (safety close on date rollover).
    - One unbroken episode over the whole dataset; terminates only at the final bar.
 
 Observation:
@@ -289,6 +290,10 @@ class ConstrainedTradingEnv(gym.Env):
         self.feature_columns: List[str] = list(numeric_df.columns)
         self.features: np.ndarray = numeric_df.to_numpy(dtype=np.float32)
         self.num_rows: int = len(self.df)
+        # Last bar of each session (next bar is another day): positions are squared off at
+        # its close, so coarse bars (1h) and half-days never carry a position overnight.
+        day_index = np.array([d.toordinal() for d in self.dates.date])
+        self.last_bar_of_day: np.ndarray = np.append(day_index[1:] != day_index[:-1], True)
         self.num_features: int = self.features.shape[1]
 
         self.action_space: spaces.Space = (
@@ -566,10 +571,14 @@ class ConstrainedTradingEnv(gym.Env):
 
         # 1. Decide target position at the current bar's close
         act_val, target = self._action_to_target(action)
-        if self.locked_out_for_day or time_now >= self.auto_square_off_time:
+        forced_flat = (
+            self.locked_out_for_day
+            or time_now >= self.auto_square_off_time
+            or bool(self.last_bar_of_day[self.current_step])
+        )
+        if forced_flat:
             target = 0
 
-        forced_flat = self.locked_out_for_day or time_now >= self.auto_square_off_time
         if self.exit_blocked and not forced_flat:
             target = self.position_direction  # minimum holding period: keep the position
 

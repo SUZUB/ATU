@@ -45,6 +45,7 @@ try:
         create_final_state_vector,
         fetch_recent_headlines,
         is_indian_ticker,
+        mirror_ohlcv,
     )
     from constrained_trading_env import ConstrainedTradingEnv
     from src.data_processing import SentimentProcessor, load_archive_headlines
@@ -56,6 +57,7 @@ except ImportError:
         create_final_state_vector,
         fetch_recent_headlines,
         is_indian_ticker,
+        mirror_ohlcv,
     )
     from constrained_trading_env import ConstrainedTradingEnv
     from src.data_processing import SentimentProcessor, load_archive_headlines
@@ -73,10 +75,14 @@ A2C_KWARGS: Dict[str, Any] = dict(
     ent_coef=0.01, max_grad_norm=0.5,
 )
 # name -> (algorithm, hyperparameters, checkpoint file, normalization stats file)
+# v2: trained under the risk-managed env (ATR stops, shaped reward, mirrored data).
 AGENT_SPECS: Dict[str, Tuple[type, Dict[str, Any], str, str]] = {
-    "PPO": (PPO, PPO_KWARGS, "ppo_trading_agent_v1.zip", "ppo_vecnormalize.pkl"),
-    "A2C": (A2C, A2C_KWARGS, "a2c_trading_agent_v1.zip", "a2c_vecnormalize.pkl"),
+    "PPO": (PPO, PPO_KWARGS, "ppo_trading_agent_v2.zip", "ppo_vecnormalize_v2.pkl"),
+    "A2C": (A2C, A2C_KWARGS, "a2c_trading_agent_v2.zip", "a2c_vecnormalize_v2.pkl"),
 }
+DEFAULT_INTERVAL: str = "1h"   # ~2 years of history (yfinance keeps 5m bars for 60 days only)
+DEFAULT_PERIOD: str = "730d"
+DEFAULT_TRAIN_PASSES: int = 20  # passes over the (original + mirrored) training data per agent
 REWARD_CLIP: float = 10.0
 ACTION_SHORT, ACTION_FLAT, ACTION_LONG = 0, 1, 2  # ConstrainedTradingEnv Discrete(3)
 COLLAPSE_THRESHOLD: float = 0.95  # warn when one agent emits one signal on >95% of test bars
@@ -93,6 +99,13 @@ def session_rules(ticker: str) -> Dict[str, dtime]:
         return dict(session_start_time=dtime(9, 15), session_end_time=dtime(15, 30), auto_square_off_time=dtime(15, 15))
     # US equities, America/New_York
     return dict(session_start_time=dtime(9, 30), session_end_time=dtime(16, 0), auto_square_off_time=dtime(15, 45))
+
+
+def interval_rules(interval: str) -> Dict[str, int]:
+    """Holding period and re-entry cooldown in bars (~15 minutes on 5m bars, 1 bar on 1h)."""
+    minutes = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "90m": 90, "1h": 60}.get(interval, 5)
+    bars = max(1, round(15 / minutes))
+    return dict(min_hold_bars=bars, reentry_cooldown_bars=bars)
 
 
 @dataclass
@@ -264,10 +277,12 @@ class LiveData:
     ticker: str
     final_state_vector: pd.DataFrame
     market_processor: MarketDataProcessor
-    env_kwargs: Dict[str, dtime]
+    env_kwargs: Dict[str, Any]
     bars_per_day: int
     headlines: pd.DataFrame
     sentiment: Optional[pd.DataFrame]
+    interval: str = DEFAULT_INTERVAL
+    mirror_state_vector: Optional[pd.DataFrame] = None  # price-mirrored copy, training only
 
 
 def _score_recent_news(
@@ -321,8 +336,8 @@ def _score_recent_news(
 
 def build_live_state_vector(
     ticker: str = "AAPL",
-    period: str = "60d",
-    interval: str = "5m",
+    period: str = DEFAULT_PERIOD,
+    interval: str = DEFAULT_INTERVAL,
     data_dir: Optional[str] = None,
     use_finbert: bool = True,
     device: str = "auto",
@@ -338,10 +353,12 @@ def build_live_state_vector(
     archive CSVs (off by default: they cannot overlap a recent 60-day window).
     `use_news=False` skips news and FinBERT entirely (price data only, neutral sentiment).
     Any failure in the optional news step degrades to neutral sentiment instead of raising.
+    Also builds a price-mirrored copy (`mirror_state_vector`) used only as extra training data.
     """
     print(f"\n[Data 1/3] Downloading real {interval} candles for {ticker} (period={period})...")
     market_processor = MarketDataProcessor()  # scaler fit on the first 80% only
-    market_df = market_processor.process(ticker=ticker, period=period, interval=interval)
+    raw_df = market_processor.fetch_data(ticker=ticker, period=period, interval=interval)
+    market_df = market_processor.process_dataframe(raw_df)
     exchange_tz = market_df.index.tz
     bar_dates = pd.Series(market_df.index.date)
     bars_per_day = int(bar_dates.value_counts().median())
@@ -375,14 +392,28 @@ def build_live_state_vector(
     if require_sentiment and coverage_all == 0.0:
         raise ValueError("No bar received non-zero sentiment (require_sentiment=True).")
 
+    # Mirrored copy (every return negated, sentiment negated) with its own leak-free scaler
+    mirror_processor = MarketDataProcessor(train_ratio=market_processor.train_ratio)
+    mirror_market = mirror_processor.process_dataframe(mirror_ohlcv(raw_df))
+    mirror_sentiment = None
+    if sentiment_df is not None and not sentiment_df.empty:
+        mirror_sentiment = sentiment_df.assign(daily_sentiment=-sentiment_df["daily_sentiment"])
+    mirror_state_vector: Optional[pd.DataFrame] = create_final_state_vector(mirror_market, mirror_sentiment)
+    if not (mirror_state_vector.index.equals(final_state_vector.index)
+            and list(mirror_state_vector.columns) == list(final_state_vector.columns)):
+        print("  - WARNING: mirrored data does not align with the original; training without it.")
+        mirror_state_vector = None
+
     return LiveData(
         ticker=ticker,
         final_state_vector=final_state_vector,
         market_processor=market_processor,
-        env_kwargs=session_rules(ticker),
+        env_kwargs={**session_rules(ticker), **interval_rules(interval)},
         bars_per_day=bars_per_day,
         headlines=headlines,
         sentiment=sentiment_df,
+        interval=interval,
+        mirror_state_vector=mirror_state_vector,
     )
 
 
@@ -405,10 +436,19 @@ def has_finite_weights(model: BaseAlgorithm) -> bool:
     return all(torch.isfinite(p).all().item() for p in model.policy.parameters())
 
 
-def make_train_env(train_df: pd.DataFrame, env_kwargs: Dict[str, Any], stats_path: Path) -> VecNormalize:
-    """Reward-normalized training env; restores running reward stats when resuming."""
-    venv = DummyVecEnv([lambda: ConstrainedTradingEnv(df=train_df, **env_kwargs)])
-    if stats_path.exists():
+def make_train_env(
+    train_dfs: Sequence[pd.DataFrame],
+    env_kwargs: Dict[str, Any],
+    stats_path: Path,
+    resume: bool = False,
+) -> VecNormalize:
+    """
+    Reward-normalized training env with one sub-env per data frame (original + mirrored),
+    so every rollout batch mixes both price directions. Restores running reward stats
+    only when resuming.
+    """
+    venv = DummyVecEnv([(lambda d=d: ConstrainedTradingEnv(df=d, **env_kwargs)) for d in train_dfs])
+    if resume and stats_path.exists():
         try:
             env = VecNormalize.load(str(stats_path), venv)
             env.training = True
@@ -426,10 +466,18 @@ def load_or_create(
     checkpoint_path: Path,
     tensorboard_log: Optional[str],
     seed: int = 42,
+    resume: bool = False,
 ) -> BaseAlgorithm:
-    """Resumes a compatible, finite checkpoint; otherwise builds a fresh model. Never deletes files."""
+    """
+    resume=True: continue a compatible, finite checkpoint if one exists.
+    resume=False (default): always a fresh model, so every run is a clean experiment with
+    a fixed training budget (resuming keeps adding passes over the same data -> overfitting).
+    Never deletes files.
+    """
     algo_cls, hyperparams, _, _ = AGENT_SPECS[name]
-    if checkpoint_path.exists():
+    if not resume:
+        print(f"[Fresh Initialization] {name} (resume=False).")
+    elif checkpoint_path.exists():
         try:
             model = algo_cls.load(str(checkpoint_path), env=env, device="cpu")
             if not has_finite_weights(model):
@@ -456,11 +504,14 @@ def train_ensemble(
     tensorboard: bool = True,
     log_interval: int = 1000,
     seed: int = 42,
+    extra_train_dfs: Sequence[pd.DataFrame] = (),
+    resume: bool = False,
 ) -> Dict[str, BaseAlgorithm]:
     """
     Trains PPO then A2C in chunks, saving model + VecNormalize stats after each chunk.
     Each seed has its own folder (<workspace>/checkpoints/seed_<seed>/), so several
-    independent ensembles can be trained and compared.
+    independent ensembles can be trained and compared. `extra_train_dfs` (e.g. the
+    mirrored training slice) run as additional parallel sub-envs.
     """
     paths = WorkspacePaths(Path(workspace)).create()
     if tensorboard and importlib.util.find_spec("tensorboard") is None:
@@ -474,9 +525,9 @@ def train_ensemble(
         print(f"\nBuilding {name} training environment (seed {seed})...")
         checkpoint_path = seed_dir / checkpoint_file
         stats_path = seed_dir / stats_file
-        env = make_train_env(train_df, env_kwargs, stats_path)
+        env = make_train_env([train_df, *extra_train_dfs], env_kwargs, stats_path, resume=resume)
         tb_dir = str(paths.training_logs / f"seed_{seed}" / name.lower()) if tensorboard else None
-        model = load_or_create(name, env, checkpoint_path, tb_dir, seed=seed)
+        model = load_or_create(name, env, checkpoint_path, tb_dir, seed=seed, resume=resume)
 
         print(f"[Training] {name}: {chunks} chunks x {steps_per_chunk:,} steps = {chunks * steps_per_chunk:,} timesteps")
         for chunk in range(chunks):
@@ -831,24 +882,40 @@ def run_experiment(
     data: "LiveData",
     workspace: str,
     seeds: Sequence[int] = (0, 1, 2),
-    chunks: int = 10,
-    steps_per_chunk: int = 50_000,
+    train_passes: float = DEFAULT_TRAIN_PASSES,
+    chunks: int = 5,
+    steps_per_chunk: Optional[int] = None,
     tensorboard: bool = True,
     show_plot: bool = False,
+    use_mirror: bool = True,
+    resume: bool = False,
 ) -> ExperimentResult:
     """
-    Trains one PPO + A2C ensemble per seed on the same training slice, backtests each
-    on the same test slice, saves per-seed results to <workspace>/results/seed_<seed>/
-    and a cross-seed summary to <workspace>/results/.
+    Trains one PPO + A2C ensemble per seed on the same training slice (plus its price
+    mirror), backtests each on the same test slice, saves per-seed results to
+    <workspace>/results/seed_<seed>/ and a cross-seed summary to <workspace>/results/.
+
+    Training budget per agent = `train_passes` passes over all training sub-envs,
+    unless `steps_per_chunk` is given explicitly.
     """
     paths = WorkspacePaths(Path(workspace)).create()
     train_df, test_df = split_train_test(data.final_state_vector, data.market_processor)
+    extra: List[pd.DataFrame] = []
+    if use_mirror and data.mirror_state_vector is not None:
+        extra.append(data.mirror_state_vector.iloc[: len(train_df)].copy())
+    if steps_per_chunk is None:
+        total = int(train_passes * len(train_df) * (1 + len(extra)))
+        steps_per_chunk = max(1, math.ceil(total / chunks))
+    print(f"Training budget per agent: {chunks} x {steps_per_chunk:,} = {chunks * steps_per_chunk:,} steps "
+          f"(~{chunks * steps_per_chunk / (len(train_df) * (1 + len(extra))):.1f} passes; "
+          f"mirror {'on' if extra else 'off'}; resume {'on' if resume else 'off'})")
     runs: Dict[int, BacktestResult] = {}
     for seed in seeds:
         print("\n" + "#" * 65 + f"\n#  SEED {seed}\n" + "#" * 65)
         models = train_ensemble(
             train_df, data.env_kwargs, workspace=str(paths.root),
             chunks=chunks, steps_per_chunk=steps_per_chunk, tensorboard=tensorboard, seed=seed,
+            extra_train_dfs=extra, resume=resume,
         )
         result = run_ensemble_backtest(models, test_df, data.env_kwargs, data.bars_per_day, data.ticker)
         save_backtest_results(result, str(paths.results / f"seed_{seed}"), show_plot=False)
@@ -889,9 +956,10 @@ def run_experiment(
 def run_pipeline(
     ticker: str = "AAPL",
     workspace: str = "ATU_Workspace",
-    total_timesteps: int = 500_000,
-    chunks: int = 10,
-    period: str = "60d",
+    train_passes: float = DEFAULT_TRAIN_PASSES,
+    chunks: int = 5,
+    period: str = DEFAULT_PERIOD,
+    interval: str = DEFAULT_INTERVAL,
     data_dir: Optional[str] = None,
     use_finbert: bool = True,
     device: str = "auto",
@@ -901,22 +969,23 @@ def run_pipeline(
     include_archive: bool = False,
     use_news: bool = True,
     seeds: Sequence[int] = (0, 1, 2),
+    use_mirror: bool = True,
+    resume: bool = False,
 ) -> ExperimentResult:
-    """Same steps as ATU_GPU.ipynb cells 3-4. `total_timesteps` is per agent, per seed."""
+    """Same steps as ATU_GPU.ipynb cells 3-4."""
     print("=" * 70)
     print("   ATU PIPELINE: REAL DATA -> PPO + A2C ENSEMBLE -> WALK-FORWARD BACKTEST   ")
     print("=" * 70)
     paths = WorkspacePaths(Path(workspace)).create()
     data = build_live_state_vector(
-        ticker=ticker, period=period,
+        ticker=ticker, period=period, interval=interval,
         data_dir=str(data_dir) if data_dir else str(paths.datasets),
         use_finbert=use_finbert, device=device, news_queries=news_queries,
         require_sentiment=require_sentiment, include_archive=include_archive, use_news=use_news,
     )
-    steps_per_chunk = max(1, math.ceil(total_timesteps / chunks))
     experiment = run_experiment(
-        data, workspace=str(paths.root), seeds=seeds,
-        chunks=chunks, steps_per_chunk=steps_per_chunk, tensorboard=tensorboard,
+        data, workspace=str(paths.root), seeds=seeds, train_passes=train_passes,
+        chunks=chunks, tensorboard=tensorboard, use_mirror=use_mirror, resume=resume,
     )
     print("\n" + experiment.report)
     print(f"Results: {paths.results}")
@@ -934,11 +1003,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--workspace", "--model-save-path", dest="workspace", default="ATU_Workspace",
                         help="Folder for datasets/, checkpoints/, training_logs/, results/ "
                              "(Colab: /content/drive/MyDrive/ATU_Workspace)")
-    parser.add_argument("--timesteps", type=int, default=500_000, help="Training timesteps PER AGENT (default: 500000)")
-    parser.add_argument("--chunks", type=int, default=10, help="Checkpoint chunks per agent (default: 10)")
+    parser.add_argument("--passes", type=float, default=DEFAULT_TRAIN_PASSES,
+                        help=f"Training passes over the (original + mirrored) training data per agent "
+                             f"(default: {DEFAULT_TRAIN_PASSES})")
+    parser.add_argument("--chunks", type=int, default=5, help="Checkpoint chunks per agent (default: 5)")
+    parser.add_argument("--interval", default=DEFAULT_INTERVAL,
+                        help=f"Bar size (default: {DEFAULT_INTERVAL}; 5m is limited to the last 60 days)")
+    parser.add_argument("--no-mirror", dest="mirror", action="store_false",
+                        help="Do not add the price-mirrored copy to the training data")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue from existing checkpoints instead of training fresh models")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2],
                         help="Train one ensemble per seed and compare them (default: 0 1 2)")
-    parser.add_argument("--period", default="60d", help="yfinance period for 5m candles (max 60d)")
+    parser.add_argument("--period", default=DEFAULT_PERIOD,
+                        help=f"yfinance period (default: {DEFAULT_PERIOD}; max 730d for 1h, 60d for 5m)")
     parser.add_argument("--data-dir", default=None, help="Headline cache/archive folder (default: <workspace>/datasets)")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="FinBERT device")
     parser.add_argument("--no-finbert", dest="finbert", action="store_false", help="Skip FinBERT (neutral sentiment)")
@@ -956,9 +1034,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     run_pipeline(
         ticker=args.ticker,
         workspace=args.workspace,
-        total_timesteps=args.timesteps,
+        train_passes=args.passes,
         chunks=args.chunks,
         period=args.period,
+        interval=args.interval,
         data_dir=args.data_dir,
         use_finbert=args.finbert,
         device=args.device,
@@ -968,6 +1047,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         include_archive=args.include_archive,
         use_news=args.news,
         seeds=args.seeds,
+        use_mirror=args.mirror,
+        resume=args.resume,
     )
 
 
