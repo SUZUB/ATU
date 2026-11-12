@@ -21,6 +21,7 @@ XD/
 ├── constrained_trading_env.py  # File 3: Gymnasium trading environment
 ├── train_and_backtest.py       # File 4: CLI entry point (thin wrapper over src/train.py)
 ├── research_strategies.py      # Rule-based 5-min Opening Range Breakout (paper-based), edge check
+├── orb_model.py                # Trained + saved ORB model (learns which ORB trades to take)
 └── requirements.txt
 ```
 
@@ -135,6 +136,7 @@ Key CLI options (`python train_and_backtest.py --help`):
 4. **Cell 3** builds the real-data state vector. Change `TICKER`, `INTERVAL`, `PERIOD` here.
 5. **Cell 4** trains one PPO + A2C ensemble per seed (`SEEDS`, `TRAIN_PASSES`), backtests each and prints the per-seed reports and the cross-seed summary.
 6. **Cell 5** runs the rule-based 5-minute Opening Range Breakout on a stock universe (no RL) and saves `results/research/`.
+7. **Cell 6** loads the saved ORB model from Drive, updates it with new data, saves it again and prints today's signals.
 
 Equivalent CLI inside Colab:
 ```bash
@@ -177,3 +179,19 @@ What we found (Nov 2026, 12-13 large US stocks):
 | RL agents (Cells 3-4), 2 years | Learn to stay flat: indicators alone do not beat fees |
 
 Costs decide the outcome: the paper assumes ~0.002% per side. Yahoo serves only 60 days of 5-minute bars, so every run **merges new bars into `datasets/intraday/`** and the out-of-sample record grows over time. Trust the strategy only when both halves stay positive at your real costs, and paper-trade it before risking money.
+
+### 8.1 Trained ORB model (`orb_model.py`, notebook Cell 6)
+
+- **Sample** = one stock on one day, at 09:35 ET (first 5-minute candle closed). 12 features: candle direction/body/range/wicks, relative opening volume, gap, previous-day return and range, 10-day average range, SPY's first candle.
+- **Labels** = net R (after fees) of a 1:3 bracket trade LONG and SHORT (stop = other side of the first candle).
+- **Model** = two small gradient-boosted tree regressors; trade the better side if its predicted R > +0.10R.
+- **Leak guard** = before training, prices after 09:35 are scrambled and every feature must stay identical (this caught a real look-ahead bug during development).
+- **Evaluation** = walk-forward, retrained every 5 sessions on the past only, compared with plain ORB on the same days.
+- **Persistence** = `<workspace>/models/orb_model.joblib` (+ dated copies, `orb_model.json` metadata). Each run loads it, retrains on all accumulated history and saves a new version.
+- **Live signals** use the model only if it beat plain ORB in both halves of the out-of-sample test; otherwise plain ORB.
+
+First result (40 US stocks, 59 sessions, 39 out-of-sample, 0.01% fees/side): model +2.77% vs plain ORB +2.76%; plain ORB was positive in both halves (+1.6%, +1.1%, max DD -0.7%), the model was not (-0.0%, +2.8%) -> live signals currently use plain ORB.
+
+```powershell
+python orb_model.py --workspace ATU_Workspace --fee 0.0001
+```
