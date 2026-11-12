@@ -17,12 +17,14 @@ Examples:
 
 from src.train import (  # noqa: F401  (re-exported for backward compatibility)
     BacktestResult,
+    ExperimentResult,
     LiveData,
     build_live_state_vector,
     calculate_financial_metrics,
     consensus_action,
     main,
     run_ensemble_backtest,
+    run_experiment,
     run_pipeline,
     save_backtest_results,
     session_rules,
@@ -32,8 +34,8 @@ from src.train import (  # noqa: F401  (re-exported for backward compatibility)
 from market_data_processor import create_final_state_vector  # noqa: F401
 
 __all__ = [
-    "BacktestResult", "LiveData", "build_live_state_vector", "calculate_financial_metrics",
-    "consensus_action", "create_final_state_vector", "main", "run_ensemble_backtest",
+    "BacktestResult", "ExperimentResult", "LiveData", "build_live_state_vector", "calculate_financial_metrics",
+    "consensus_action", "create_final_state_vector", "main", "run_ensemble_backtest", "run_experiment",
     "run_pipeline", "save_backtest_results", "session_rules", "split_train_test", "train_ensemble",
 ]
 

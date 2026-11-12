@@ -187,6 +187,74 @@ def calculate_financial_metrics(
     }
 
 
+FLAT_DAY_TOLERANCE: float = 0.01  # |day P&L| below this (currency) counts as a no-trade / flat day
+
+
+def daily_breakdown(timestamps: Sequence[pd.Timestamp], portfolio_values: Sequence[float]) -> pd.DataFrame:
+    """
+    One row per trading day: equity at the end of the day and the day's net P&L
+    (vs. the previous day's close, or the initial balance on the first day).
+    Positions never stay open overnight, so each day's P&L is self-contained.
+    """
+    frame = pd.DataFrame({"ts": pd.DatetimeIndex(timestamps), "equity": np.asarray(portfolio_values, dtype=float)})
+    frame["date"] = frame["ts"].dt.date
+    end_equity = frame.groupby("date", sort=True)["equity"].last()
+    start_equity = end_equity.shift(1).fillna(float(frame["equity"].iloc[0]))
+    days = pd.DataFrame({"start_equity": start_equity, "end_equity": end_equity})
+    days["pnl"] = days["end_equity"] - days["start_equity"]
+    days["return_pct"] = days["pnl"] / days["start_equity"] * 100.0
+    days.index.name = "date"
+    return days
+
+
+def daily_metrics(days: pd.DataFrame) -> Dict[str, Any]:
+    """Green/red/flat day counts and day-level P&L statistics."""
+    pnl = days["pnl"].to_numpy(dtype=float)
+    green, red = pnl[pnl > FLAT_DAY_TOLERANCE], pnl[pnl < -FLAT_DAY_TOLERANCE]
+    active = len(green) + len(red)
+    return {
+        "days_total": int(len(pnl)),
+        "days_green": int(len(green)),
+        "days_red": int(len(red)),
+        "days_flat": int(len(pnl) - active),
+        "green_day_rate_pct": float(len(green) / active * 100.0) if active else 0.0,
+        "avg_green_day": float(green.mean()) if len(green) else 0.0,
+        "avg_red_day": float(red.mean()) if len(red) else 0.0,
+        "best_day": float(pnl.max()) if len(pnl) else 0.0,
+        "worst_day": float(pnl.min()) if len(pnl) else 0.0,
+    }
+
+
+def window_breakdown(days: pd.DataFrame, n_windows: int = 4) -> List[Dict[str, Any]]:
+    """
+    Splits the test days into up to `n_windows` contiguous blocks and reports each
+    block's return. One good stretch can carry a whole backtest; this shows whether
+    the result is consistent over time.
+    """
+    n_windows = max(1, min(int(n_windows), len(days)))
+    out = []
+    for block in np.array_split(np.arange(len(days)), n_windows):
+        if len(block) == 0:
+            continue
+        part = days.iloc[block]
+        start, end = float(part["start_equity"].iloc[0]), float(part["end_equity"].iloc[-1])
+        out.append({
+            "start": str(part.index[0]),
+            "end": str(part.index[-1]),
+            "days": int(len(part)),
+            "return_pct": (end / start - 1.0) * 100.0 if start > 0 else 0.0,
+        })
+    return out
+
+
+def buy_and_hold_return_pct(raw_close: Sequence[float], commission_rate: float) -> float:
+    """Return of buying at the first test close and selling at the last, after two fee legs."""
+    prices = np.asarray(raw_close, dtype=float)
+    if len(prices) < 2 or prices[0] <= 0:
+        return 0.0
+    return float(((prices[-1] / prices[0]) * (1.0 - commission_rate) * (1.0 - commission_rate) - 1.0) * 100.0)
+
+
 # =====================================================================
 # 1-3. Real data: prices + news sentiment -> final_state_vector
 # =====================================================================
@@ -356,6 +424,7 @@ def load_or_create(
     env: VecNormalize,
     checkpoint_path: Path,
     tensorboard_log: Optional[str],
+    seed: int = 42,
 ) -> BaseAlgorithm:
     """Resumes a compatible, finite checkpoint; otherwise builds a fresh model. Never deletes files."""
     algo_cls, hyperparams, _, _ = AGENT_SPECS[name]
@@ -372,7 +441,7 @@ def load_or_create(
     else:
         print(f"[Fresh Initialization] No {name} checkpoint at {checkpoint_path}.")
     return algo_cls(
-        policy="MlpPolicy", env=env, verbose=1, seed=42, device="cpu",
+        policy="MlpPolicy", env=env, verbose=1, seed=seed, device="cpu",
         tensorboard_log=tensorboard_log, **hyperparams,
     )
 
@@ -385,21 +454,28 @@ def train_ensemble(
     steps_per_chunk: int = 50_000,
     tensorboard: bool = True,
     log_interval: int = 1000,
+    seed: int = 42,
 ) -> Dict[str, BaseAlgorithm]:
-    """Trains PPO then A2C in chunks, saving model + VecNormalize stats after each chunk."""
+    """
+    Trains PPO then A2C in chunks, saving model + VecNormalize stats after each chunk.
+    Each seed has its own folder (<workspace>/checkpoints/seed_<seed>/), so several
+    independent ensembles can be trained and compared.
+    """
     paths = WorkspacePaths(Path(workspace)).create()
     if tensorboard and importlib.util.find_spec("tensorboard") is None:
         print("TensorBoard is not installed; training without TensorBoard logs.")
         tensorboard = False
+    seed_dir = paths.checkpoints / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
 
     models: Dict[str, BaseAlgorithm] = {}
     for name, (_, _, checkpoint_file, stats_file) in AGENT_SPECS.items():
-        print(f"\nBuilding {name} training environment...")
-        checkpoint_path = paths.checkpoints / checkpoint_file
-        stats_path = paths.checkpoints / stats_file
+        print(f"\nBuilding {name} training environment (seed {seed})...")
+        checkpoint_path = seed_dir / checkpoint_file
+        stats_path = seed_dir / stats_file
         env = make_train_env(train_df, env_kwargs, stats_path)
-        tb_dir = str(paths.training_logs / name.lower()) if tensorboard else None
-        model = load_or_create(name, env, checkpoint_path, tb_dir)
+        tb_dir = str(paths.training_logs / f"seed_{seed}" / name.lower()) if tensorboard else None
+        model = load_or_create(name, env, checkpoint_path, tb_dir, seed=seed)
 
         print(f"[Training] {name}: {chunks} chunks x {steps_per_chunk:,} steps = {chunks * steps_per_chunk:,} timesteps")
         for chunk in range(chunks):
@@ -425,6 +501,8 @@ class BacktestResult:
     step_returns: List[float] = field(default_factory=list)
     trade_pnls: List[float] = field(default_factory=list)
     initial_balance: float = 100000.0
+    days: Optional[pd.DataFrame] = None
+    benchmark_values: List[float] = field(default_factory=list)  # buy & hold equity, same timestamps
 
     @property
     def report(self) -> str:
@@ -522,6 +600,14 @@ def run_ensemble_backtest(
     metrics["total_days_processed"] = int(step_info["days_processed"])
     metrics["signal_mix"] = {name: signal_mix(acts) for name, acts in signals.items()}
     metrics["collapse_warnings"] = collapse_warnings({k: metrics["signal_mix"][k] for k in ("PPO", "A2C")})
+
+    # Day-level view, consistency over time, and a do-nothing-clever benchmark
+    result.days = daily_breakdown(result.timestamps, result.portfolio_values)
+    metrics.update(daily_metrics(result.days))
+    metrics["windows"] = window_breakdown(result.days)
+    metrics["buy_and_hold_return_pct"] = buy_and_hold_return_pct(test_env.prices, test_env.commission_rate)
+    metrics["excess_return_pct"] = metrics["net_return_pct"] - metrics["buy_and_hold_return_pct"]
+    result.benchmark_values = list(result.initial_balance * test_env.prices / test_env.prices[0])
     result.metrics = metrics
     print(f"Backtest completed: {len(result.step_returns):,} steps, {metrics['total_trades']} closed trades, "
           f"{stop_loss_hits} stop-loss exits.")
@@ -531,6 +617,9 @@ def run_ensemble_backtest(
 def format_report(metrics: Dict[str, Any]) -> str:
     pf = metrics["profit_factor"]
     pf_text = f"{pf:.2f}" if math.isfinite(pf) else "N/A (No Losing Trades)"
+    windows = metrics.get("windows", [])
+    windows_won = sum(w["return_pct"] > 0 for w in windows)
+    windows_text = ", ".join("{:+.2f}%".format(w["return_pct"]) for w in windows)
     return "\n".join([
         "=" * 65,
         "      ENSEMBLE (PPO + A2C) INSTITUTIONAL PERFORMANCE REPORT    ",
@@ -547,6 +636,15 @@ def format_report(metrics: Dict[str, Any]) -> str:
         f" Sharpe Ratio (Ann.):      {metrics['sharpe_ratio']:.4f}",
         f" Sortino Ratio (Ann.):     {metrics['sortino_ratio']:.4f}",
         f" Profit Factor (Trades):   {pf_text}",
+        f" Buy & Hold (same window): {metrics.get('buy_and_hold_return_pct', 0.0):+.2f}%  "
+        f"(strategy minus B&H: {metrics.get('excess_return_pct', 0.0):+.2f}%)",
+        "-" * 65,
+        f" Trading Days:             {metrics.get('days_total', 0)} (green {metrics.get('days_green', 0)} | "
+        f"red {metrics.get('days_red', 0)} | flat {metrics.get('days_flat', 0)})",
+        f" Green-Day Rate:           {metrics.get('green_day_rate_pct', 0.0):.1f}% of days with a trade",
+        f" Avg Green / Red Day:      ₹{metrics.get('avg_green_day', 0.0):+,.2f} / ₹{metrics.get('avg_red_day', 0.0):+,.2f}",
+        f" Best / Worst Day:         ₹{metrics.get('best_day', 0.0):+,.2f} / ₹{metrics.get('worst_day', 0.0):+,.2f}",
+        f" Sub-Windows Profitable:   {windows_won}/{len(windows)}  [{windows_text}]",
         "-" * 65,
         " Signal Mix (short / flat / long):",
         *[
@@ -566,8 +664,13 @@ def save_backtest_results(result: BacktestResult, results_dir: str, show_plot: b
         "csv": out / "backtest_portfolio_history.csv",
         "metrics": out / "evaluation_metrics.json",
         "report": out / "backtest_report.txt",
+        "daily": out / "daily_pnl.csv",
         "plot": out / "equity_curve.png",
     }
+    if result.days is not None:
+        result.days.to_csv(paths["daily"])
+    else:
+        del paths["daily"]
     pd.DataFrame({
         "timestamp": result.timestamps,
         "portfolio_value": result.portfolio_values,
@@ -582,6 +685,8 @@ def save_backtest_results(result: BacktestResult, results_dir: str, show_plot: b
 
     fig = plt.figure(figsize=(12, 5))
     plt.plot(result.portfolio_values, color="#2563EB", linewidth=1.8, label="Ensemble Portfolio Equity (₹)")
+    if result.benchmark_values:
+        plt.plot(result.benchmark_values, color="#F59E0B", linewidth=1.2, alpha=0.8, label="Buy & Hold")
     plt.axhline(result.initial_balance, color="gray", linestyle="--", alpha=0.7, label="Initial Capital")
     plt.title(f"ATU Multi-Agent Ensemble Out-of-Sample Equity Curve ({result.ticker})", fontsize=13)
     plt.xlabel("Intraday 5-Min Steps", fontsize=11)
@@ -595,6 +700,138 @@ def save_backtest_results(result: BacktestResult, results_dir: str, show_plot: b
     else:
         plt.close(fig)
     return {k: str(v) for k, v in paths.items()}
+
+
+# =====================================================================
+# Multi-seed experiment (is the result repeatable or luck?)
+# =====================================================================
+@dataclass
+class ExperimentResult:
+    ticker: str
+    runs: Dict[int, BacktestResult]
+    summary: Dict[str, Any]
+
+    @property
+    def report(self) -> str:
+        return format_experiment_summary(self.summary)
+
+
+def summarize_seeds(runs: Dict[int, BacktestResult]) -> Dict[str, Any]:
+    """Cross-seed statistics: an edge should show up in most independently trained ensembles."""
+    rows = []
+    for seed, res in runs.items():
+        m = res.metrics
+        rows.append({
+            "seed": int(seed),
+            "net_return_pct": float(m["net_return_pct"]),
+            "green_day_rate_pct": float(m.get("green_day_rate_pct", 0.0)),
+            "days_green": int(m.get("days_green", 0)),
+            "days_red": int(m.get("days_red", 0)),
+            "total_trades": int(m["total_trades"]),
+            "max_drawdown_pct": float(m["max_drawdown_pct"]),
+            "profit_factor": float(m["profit_factor"]),
+            "worst_day": float(m.get("worst_day", 0.0)),
+            "collapsed": bool(m.get("collapse_warnings")),
+        })
+    nets = np.array([r["net_return_pct"] for r in rows], dtype=float)
+    bh = float(next(iter(runs.values())).metrics.get("buy_and_hold_return_pct", 0.0)) if runs else 0.0
+    return {
+        "ticker": next(iter(runs.values())).ticker if runs else "",
+        "seeds": rows,
+        "buy_and_hold_return_pct": bh,
+        "mean_net_return_pct": float(nets.mean()) if len(nets) else 0.0,
+        "worst_net_return_pct": float(nets.min()) if len(nets) else 0.0,
+        "best_net_return_pct": float(nets.max()) if len(nets) else 0.0,
+        "seeds_profitable": int((nets > 0).sum()),
+        "seeds_beating_buy_and_hold": int((nets > bh).sum()),
+        "mean_green_day_rate_pct": float(np.mean([r["green_day_rate_pct"] for r in rows])) if rows else 0.0,
+        "n_seeds": len(rows),
+    }
+
+
+def format_experiment_summary(summary: Dict[str, Any]) -> str:
+    n = summary["n_seeds"]
+    lines = [
+        "=" * 65,
+        f"   SEED SUMMARY: {n} independently trained ensemble(s), same test window",
+        "=" * 65,
+        " Seed    Net %   Green-days  Trades   Max DD    PF   Worst day",
+    ]
+    for r in summary["seeds"]:
+        pf = f"{r['profit_factor']:.2f}" if math.isfinite(r["profit_factor"]) else "inf"
+        lines.append(
+            f" {r['seed']:<5} {r['net_return_pct']:+6.2f}%  {r['days_green']:>3}/{r['days_green'] + r['days_red']:<3} "
+            f"({r['green_day_rate_pct']:3.0f}%) {r['total_trades']:>5}  {r['max_drawdown_pct']:6.2f}%  {pf:>5}  "
+            f"₹{r['worst_day']:+,.0f}{'  COLLAPSED' if r['collapsed'] else ''}"
+        )
+    lines += [
+        "-" * 65,
+        f" Mean / Worst / Best net:  {summary['mean_net_return_pct']:+.2f}% / "
+        f"{summary['worst_net_return_pct']:+.2f}% / {summary['best_net_return_pct']:+.2f}%",
+        f" Seeds profitable:         {summary['seeds_profitable']}/{n}",
+        f" Seeds beating Buy & Hold: {summary['seeds_beating_buy_and_hold']}/{n}  "
+        f"(B&H {summary['buy_and_hold_return_pct']:+.2f}%)",
+        f" Mean green-day rate:      {summary['mean_green_day_rate_pct']:.1f}%",
+        " A real edge shows up in most seeds; one good seed out of several is luck.",
+        "=" * 65,
+    ]
+    return "\n".join(lines)
+
+
+def run_experiment(
+    data: "LiveData",
+    workspace: str,
+    seeds: Sequence[int] = (0, 1, 2),
+    chunks: int = 10,
+    steps_per_chunk: int = 50_000,
+    tensorboard: bool = True,
+    show_plot: bool = False,
+) -> ExperimentResult:
+    """
+    Trains one PPO + A2C ensemble per seed on the same training slice, backtests each
+    on the same test slice, saves per-seed results to <workspace>/results/seed_<seed>/
+    and a cross-seed summary to <workspace>/results/.
+    """
+    paths = WorkspacePaths(Path(workspace)).create()
+    train_df, test_df = split_train_test(data.final_state_vector, data.market_processor)
+    runs: Dict[int, BacktestResult] = {}
+    for seed in seeds:
+        print("\n" + "#" * 65 + f"\n#  SEED {seed}\n" + "#" * 65)
+        models = train_ensemble(
+            train_df, data.env_kwargs, workspace=str(paths.root),
+            chunks=chunks, steps_per_chunk=steps_per_chunk, tensorboard=tensorboard, seed=seed,
+        )
+        result = run_ensemble_backtest(models, test_df, data.env_kwargs, data.bars_per_day, data.ticker)
+        save_backtest_results(result, str(paths.results / f"seed_{seed}"), show_plot=False)
+        print("\n" + result.report)
+        runs[int(seed)] = result
+
+    experiment = ExperimentResult(ticker=data.ticker, runs=runs, summary=summarize_seeds(runs))
+    with open(paths.results / "seed_summary.json", "w", encoding="utf-8") as f:
+        json.dump(experiment.summary, f, indent=2)
+    with open(paths.results / "seed_summary.txt", "w", encoding="utf-8") as f:
+        f.write(experiment.report)
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(12, 5))
+    for seed, res in runs.items():
+        plt.plot(res.portfolio_values, linewidth=1.4, label=f"Seed {seed}")
+    first = next(iter(runs.values()))
+    plt.plot(first.benchmark_values, color="#F59E0B", linewidth=1.2, linestyle=":", label="Buy & Hold")
+    plt.axhline(first.initial_balance, color="gray", linestyle="--", alpha=0.7, label="Initial Capital")
+    plt.title(f"ATU Ensemble Out-of-Sample Equity by Seed ({data.ticker})", fontsize=13)
+    plt.xlabel("Test Bars", fontsize=11)
+    plt.ylabel("Portfolio Equity (₹)", fontsize=11)
+    plt.legend(fontsize=9)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(paths.results / "equity_by_seed.png", dpi=150)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+    return experiment
 
 
 # =====================================================================
@@ -614,8 +851,9 @@ def run_pipeline(
     require_sentiment: bool = False,
     include_archive: bool = False,
     use_news: bool = True,
-) -> Tuple[Dict[str, BaseAlgorithm], BacktestResult]:
-    """Same steps as ATU_GPU.ipynb cells 3-4. `total_timesteps` is per agent."""
+    seeds: Sequence[int] = (0, 1, 2),
+) -> ExperimentResult:
+    """Same steps as ATU_GPU.ipynb cells 3-4. `total_timesteps` is per agent, per seed."""
     print("=" * 70)
     print("   ATU PIPELINE: REAL DATA -> PPO + A2C ENSEMBLE -> WALK-FORWARD BACKTEST   ")
     print("=" * 70)
@@ -626,18 +864,14 @@ def run_pipeline(
         use_finbert=use_finbert, device=device, news_queries=news_queries,
         require_sentiment=require_sentiment, include_archive=include_archive, use_news=use_news,
     )
-    train_df, test_df = split_train_test(data.final_state_vector, data.market_processor)
     steps_per_chunk = max(1, math.ceil(total_timesteps / chunks))
-    models = train_ensemble(
-        train_df, data.env_kwargs, workspace=str(paths.root),
+    experiment = run_experiment(
+        data, workspace=str(paths.root), seeds=seeds,
         chunks=chunks, steps_per_chunk=steps_per_chunk, tensorboard=tensorboard,
     )
-    result = run_ensemble_backtest(models, test_df, data.env_kwargs, data.bars_per_day, ticker)
-    saved = save_backtest_results(result, str(paths.results))
-    print("\n" + result.report)
-    for label, path in saved.items():
-        print(f"  {label:<8} {path}")
-    return models, result
+    print("\n" + experiment.report)
+    print(f"Results: {paths.results}")
+    return experiment
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -653,6 +887,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                              "(Colab: /content/drive/MyDrive/ATU_Workspace)")
     parser.add_argument("--timesteps", type=int, default=500_000, help="Training timesteps PER AGENT (default: 500000)")
     parser.add_argument("--chunks", type=int, default=10, help="Checkpoint chunks per agent (default: 10)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2],
+                        help="Train one ensemble per seed and compare them (default: 0 1 2)")
     parser.add_argument("--period", default="60d", help="yfinance period for 5m candles (max 60d)")
     parser.add_argument("--data-dir", default=None, help="Headline cache/archive folder (default: <workspace>/datasets)")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="FinBERT device")
@@ -682,6 +918,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         require_sentiment=args.require_sentiment,
         include_archive=args.include_archive,
         use_news=args.news,
+        seeds=args.seeds,
     )
 
 
