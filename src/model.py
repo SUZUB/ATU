@@ -8,7 +8,8 @@ Components:
 1. ConstrainedTradingEnv (File 3):
    - Gymnasium rules engine with continuous compounding on raw (unscaled) prices.
    - Discrete(3) actions (0 short, 1 flat, 2 long); reward = net rupee P&L per step.
-   - Stop-loss at -1% with intra-candle and gap-slippage fills, day lockout after a stop.
+   - ATR-based stop with volatility sizing, trailing stop, take-profit and a daily
+     loss cap; intra-candle and gap-slippage fills; day lockout after a losing stop.
    - Session square-off (15:15 IST for NSE MIS) without terminating the episode.
    - 3-trade daily cap; 0.03% brokerage per leg (entry + exit).
 2. create_trading_env:
@@ -31,27 +32,13 @@ except ImportError:
     from constrained_trading_env import ConstrainedTradingEnv
 
 
-def create_trading_env(
-    df,
-    initial_balance: float = 100000.0,
-    max_risk_per_trade: float = 0.01,
-    profit_target: float = 0.02,
-    loss_limit: float = -0.01,
-    commission_rate: float = 0.0003,
-    max_daily_trades: int = 3,
-) -> ConstrainedTradingEnv:
+def create_trading_env(df, **env_kwargs) -> ConstrainedTradingEnv:
     """
-    Creates an instance of ConstrainedTradingEnv with configured risk parameters.
+    Creates an instance of ConstrainedTradingEnv. Any ConstrainedTradingEnv argument
+    (risk, stops, sizing, session times, ...) can be overridden via keyword; the env's
+    own defaults are the single source of truth.
     """
-    return ConstrainedTradingEnv(
-        df=df,
-        initial_balance=initial_balance,
-        max_risk_per_trade=max_risk_per_trade,
-        profit_target=profit_target,
-        loss_limit=loss_limit,
-        commission_rate=commission_rate,
-        max_daily_trades=max_daily_trades,
-    )
+    return ConstrainedTradingEnv(df=df, **env_kwargs)
 
 
 def create_vectorized_env(df, **env_kwargs) -> DummyVecEnv:

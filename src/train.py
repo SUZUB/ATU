@@ -596,6 +596,7 @@ def run_ensemble_backtest(
         initial_balance=float(test_env.initial_balance),
     )
     stop_loss_hits = 0
+    exit_counts = {"trailing_stop_hit": 0, "take_profit_hit": 0, "daily_cap_hit": 0}
     done = False
     step_info: Dict[str, Any] = info
     signals: Dict[str, List[int]] = {"PPO": [], "A2C": [], "Ensemble": []}
@@ -614,6 +615,8 @@ def run_ensemble_backtest(
         result.step_returns.append(float(step_info["step_profit"]))
         result.trade_pnls.extend(step_info["closed_trade_pnls"])
         stop_loss_hits += int(step_info["stop_loss_hit"])
+        for key in exit_counts:
+            exit_counts[key] += int(step_info.get(key, False))
 
     metrics = calculate_financial_metrics(
         portfolio_values=result.portfolio_values,
@@ -629,6 +632,13 @@ def run_ensemble_backtest(
     gross_losses = abs(sum(p for p in result.trade_pnls if p < 0.0))
     metrics["profit_factor"] = (gross_wins / gross_losses) if gross_losses > 0.0 else (float("inf") if gross_wins > 0.0 else 0.0)
     metrics["stop_loss_exits"] = stop_loss_hits
+    metrics["trailing_stop_exits"] = exit_counts["trailing_stop_hit"]
+    metrics["take_profit_exits"] = exit_counts["take_profit_hit"]
+    metrics["daily_loss_cap_hits"] = exit_counts["daily_cap_hit"]
+    wins = [p for p in result.trade_pnls if p > 0.0]
+    losses = [p for p in result.trade_pnls if p < 0.0]
+    metrics["avg_win_trade"] = float(np.mean(wins)) if wins else 0.0
+    metrics["avg_loss_trade"] = float(np.mean(losses)) if losses else 0.0
     metrics["ticker"] = ticker
     metrics["test_start"] = str(test_df.index[0])
     metrics["test_end"] = str(test_df.index[-1])
@@ -668,6 +678,9 @@ def format_report(metrics: Dict[str, Any]) -> str:
         f" Total Brokerage & STT:    ₹{metrics['total_fees_paid']:,.2f}",
         f" Closed Trades:            {metrics['total_trades']:,} (Win Rate: {metrics['win_rate_pct']:.1f}%, "
         f"Stop-Loss Exits: {metrics['stop_loss_exits']})",
+        f" Exits: Trail / TP / Cap:  {metrics.get('trailing_stop_exits', 0)} / {metrics.get('take_profit_exits', 0)} / "
+        f"{metrics.get('daily_loss_cap_hits', 0)}   Avg Win / Loss Trade: "
+        f"₹{metrics.get('avg_win_trade', 0.0):+,.2f} / ₹{metrics.get('avg_loss_trade', 0.0):+,.2f}",
         f" Maximum Drawdown:         {metrics['max_drawdown_pct']:.2f}%",
         f" Sharpe Ratio (Ann.):      {metrics['sharpe_ratio']:.4f}",
         f" Sortino Ratio (Ann.):     {metrics['sortino_ratio']:.4f}",

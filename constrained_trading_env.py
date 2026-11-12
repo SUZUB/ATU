@@ -21,15 +21,18 @@ Design (v4):
    (equity after step) - (equity before step), where equity = cash + mark-to-market
    of the open position. Fees are already deducted from cash, so they are included.
    No multipliers, no clipping.
-4. Position sizing:
-   Notional = account_balance * max_risk_per_trade / |loss_limit| at entry, so a
-   stop-loss hit loses ~max_risk_per_trade of equity (defaults: 1% / 1% -> 1.0x).
+4. Risk & sizing:
+   1R (initial stop distance) = 2 x ATR(14) / price, clipped to [0.3%, 2%] (fixed
+   |loss_limit| during ATR warm-up). Notional = equity * max_risk_per_trade / 1R, capped
+   at 1x, so an initial-stop hit costs ~0.5% of equity. Trailing stop: from +1R the stop
+   follows the best price at 1R distance (break-even first). Take-profit at +3R.
+   Daily loss cap: at -1% of the day's starting equity the position is closed and the
+   agent is locked out until the next session.
 5. Rules:
    - Max `max_daily_trades` entries per calendar day.
-   - Stop-loss: the stop price is entry * (1 + loss_limit) for longs and
-     entry * (1 - loss_limit) for shorts. If the next candle's raw low (long) or raw
-     high (short) breaches it, the position is closed at the stop price and the agent is
-     locked out for the rest of the day. Gap slippage: if that candle's raw open is
+   - Stop-loss: if a candle's raw low (long) or raw high (short) breaches the current
+     stop, the position is closed at the stop price. A losing stop locks the agent out
+     for the rest of the day; a trailed stop that exits in profit does not. Gap slippage: if that candle's raw open is
      already strictly beyond the stop (below it for a long, above it for a short), the
      fill is the raw open instead. Without `raw_high`/`raw_low` the breach check uses
      the close; without `raw_open` the fill is the stop price.
@@ -98,7 +101,7 @@ class ConstrainedTradingEnv(gym.Env):
         self,
         df: pd.DataFrame,
         initial_balance: float = 100000.0,
-        max_risk_per_trade: float = 0.01,
+        max_risk_per_trade: float = 0.005,
         profit_target: float = 0.02,
         loss_limit: float = -0.01,
         commission_rate: float = 0.0003,
@@ -115,6 +118,15 @@ class ConstrainedTradingEnv(gym.Env):
         discrete_actions: bool = True,
         min_hold_bars: int = 3,
         reentry_cooldown_bars: int = 3,
+        stop_atr_multiple: Optional[float] = 2.0,
+        atr_window: int = 14,
+        min_stop_pct: float = 0.003,
+        max_stop_pct: float = 0.02,
+        max_position_leverage: float = 1.0,
+        trail_activation_r: Optional[float] = 1.0,
+        trail_distance_r: float = 1.0,
+        take_profit_r: Optional[float] = 3.0,
+        daily_loss_limit: Optional[float] = 0.01,
     ) -> None:
         """
         Args:
@@ -122,9 +134,10 @@ class ConstrainedTradingEnv(gym.Env):
                 unscaled prices in `raw_price_col`; otherwise `price_col` is used and must
                 itself be unscaled.
             initial_balance: Starting equity.
-            max_risk_per_trade: Fraction of equity lost if the stop-loss is hit (drives sizing).
-            profit_target: Reserved; not enforced (the agent chooses its exits).
-            loss_limit: Stop-loss threshold as a price-move fraction of the position (negative).
+            max_risk_per_trade: Fraction of equity lost if the initial stop is hit (drives sizing).
+            profit_target: Legacy; unused (see take_profit_r).
+            loss_limit: Fixed stop distance (negative price-move fraction) used when
+                `stop_atr_multiple` is None or ATR is not yet available.
             commission_rate: Fee fraction charged on each leg's traded notional.
             max_daily_trades: Maximum entries per calendar day.
             auto_square_off_time: MIS cut-off time.
@@ -140,6 +153,15 @@ class ConstrainedTradingEnv(gym.Env):
             min_hold_bars: A position cannot be closed or flipped by the agent until it has
                 been held this many bars (stops, square-off and rollover still apply).
             reentry_cooldown_bars: After any exit, no new entry for this many bars.
+            stop_atr_multiple: Initial stop distance = this x ATR(atr_window) / price,
+                clipped to [min_stop_pct, max_stop_pct]. None -> fixed |loss_limit|.
+            max_position_leverage: Cap on notional / equity.
+            trail_activation_r: Once the best price is this many stop-distances (R) in
+                profit, the stop trails the best price at `trail_distance_r` R
+                (1.0 / 1.0 -> break-even at +1R). None disables trailing.
+            take_profit_r: Close the trade at entry +/- this many R. None disables it.
+            daily_loss_limit: Close and lock out for the day once equity falls this
+                fraction below the day's starting equity. None disables it.
         """
         super().__init__()
 
@@ -176,8 +198,18 @@ class ConstrainedTradingEnv(gym.Env):
         self._session_start_s: int = _seconds(session_start_time)
         self._session_len_s: int = _seconds(session_end_time) - self._session_start_s
 
-        # Fixed leverage so that a stop-loss hit costs ~max_risk_per_trade of equity
-        self.position_leverage: float = self.max_risk_per_trade / abs(self.loss_limit)
+        self.stop_atr_multiple: Optional[float] = None if stop_atr_multiple is None else float(stop_atr_multiple)
+        self.min_stop_pct: float = float(min_stop_pct)
+        self.max_stop_pct: float = float(max_stop_pct)
+        self.max_position_leverage: float = float(max_position_leverage)
+        self.trail_activation_r: Optional[float] = None if trail_activation_r is None else float(trail_activation_r)
+        self.trail_distance_r: float = float(trail_distance_r)
+        self.take_profit_r: Optional[float] = None if take_profit_r is None else float(take_profit_r)
+        self.daily_loss_limit: Optional[float] = None if daily_loss_limit is None else float(daily_loss_limit)
+        if not 0.0 < self.min_stop_pct <= self.max_stop_pct:
+            raise ValueError("Require 0 < min_stop_pct <= max_stop_pct")
+        if self.max_position_leverage <= 0.0:
+            raise ValueError("max_position_leverage must be positive")
 
         # Unscaled price series for all accounting
         if raw_price_col in self.df.columns:
@@ -220,6 +252,19 @@ class ConstrainedTradingEnv(gym.Env):
             if not np.all(np.isfinite(self.opens)) or np.any(self.opens <= 0.0):
                 raise ValueError(f"'{raw_open_col}' must contain strictly positive, finite, UNSCALED prices.")
 
+        # Causal ATR as a fraction of price (uses bars <= i only), for stops and sizing
+        prev_close = np.concatenate([[self.prices[0]], self.prices[:-1]])
+        if self.highs is not None and self.lows is not None:
+            true_range = np.maximum.reduce([
+                self.highs - self.lows,
+                np.abs(self.highs - prev_close),
+                np.abs(self.lows - prev_close),
+            ])
+        else:
+            true_range = np.abs(self.prices - prev_close)
+        atr = pd.Series(true_range).rolling(int(atr_window), min_periods=int(atr_window)).mean().to_numpy()
+        self.atr_frac: np.ndarray = atr / self.prices  # NaN during warm-up -> fixed stop
+
         # Observation features: all numeric columns except the dedicated raw price columns
         numeric_df = self.df.select_dtypes(include=[np.number])
         excluded = [raw_high_col, raw_low_col, raw_open_col]
@@ -261,6 +306,7 @@ class ConstrainedTradingEnv(gym.Env):
         self.locked_out_for_day: bool = False
         self.last_action: float = 0.0
         self.bars_since_exit: int = 10**9  # no exit yet -> no cooldown
+        self.day_start_equity: float = self.initial_balance
         self._clear_position()
 
     def _clear_position(self) -> None:
@@ -271,6 +317,10 @@ class ConstrainedTradingEnv(gym.Env):
         self.entry_fee: float = 0.0
         self.unrealized_pnl: float = 0.0  # currency, gross of fees
         self.bars_held: int = 0
+        self.stop_distance: float = 0.0  # initial stop distance as a price fraction (1R)
+        self.stop_level: float = 0.0
+        self.take_profit_level: Optional[float] = None
+        self.best_price: float = 0.0
 
     @property
     def is_active_position(self) -> bool:
@@ -349,8 +399,16 @@ class ConstrainedTradingEnv(gym.Env):
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
+    def initial_stop_distance(self, idx: int) -> float:
+        """1R as a price fraction: k x ATR / price clipped to [min, max], else |loss_limit|."""
+        if self.stop_atr_multiple is not None and idx < len(self.atr_frac) and np.isfinite(self.atr_frac[idx]):
+            return float(np.clip(self.stop_atr_multiple * self.atr_frac[idx], self.min_stop_pct, self.max_stop_pct))
+        return abs(self.loss_limit)
+
     def _open_position(self, direction: int, price: float) -> None:
-        notional = self.account_balance * self.position_leverage
+        stop_distance = self.initial_stop_distance(self.current_step)
+        leverage = min(self.max_risk_per_trade / stop_distance, self.max_position_leverage)
+        notional = self.account_balance * leverage
         fee = notional * self.commission_rate
         self.account_balance -= fee
         self.total_fees_paid += fee
@@ -361,6 +419,12 @@ class ConstrainedTradingEnv(gym.Env):
         self.entry_notional = float(notional)
         self.entry_fee = float(fee)
         self.unrealized_pnl = 0.0
+        self.stop_distance = stop_distance
+        self.stop_level = price * (1.0 - direction * stop_distance)
+        self.take_profit_level = (
+            price * (1.0 + direction * self.take_profit_r * stop_distance) if self.take_profit_r is not None else None
+        )
+        self.best_price = float(price)
 
         self.bars_held = 0
         self.daily_trades_count += 1
@@ -384,12 +448,50 @@ class ConstrainedTradingEnv(gym.Env):
 
     @property
     def stop_price(self) -> float:
-        """Price at which the open position loses exactly |loss_limit| of its entry notional."""
+        """Current protective stop (initial ATR stop, ratcheted by the trailing rule)."""
+        return self.stop_level if self.is_active_position else 0.0
+
+    def _update_trailing_stop(self, idx: int) -> None:
+        """After bar `idx` closes: track the best price and ratchet the stop (never loosens)."""
+        if not self.is_active_position:
+            return
         if self.position_direction == 1:
-            return self.entry_price * (1.0 + self.loss_limit)
-        if self.position_direction == -1:
-            return self.entry_price * (1.0 - self.loss_limit)
-        return 0.0
+            extreme = self.highs[idx] if self.highs is not None else self.prices[idx]
+            self.best_price = max(self.best_price, float(extreme))
+        else:
+            extreme = self.lows[idx] if self.lows is not None else self.prices[idx]
+            self.best_price = min(self.best_price, float(extreme))
+        if self.trail_activation_r is None:
+            return
+        r = self.stop_distance * self.entry_price
+        favorable = self.position_direction * (self.best_price - self.entry_price)
+        if favorable >= self.trail_activation_r * r:
+            trail = self.best_price - self.position_direction * self.trail_distance_r * r
+            if self.position_direction == 1:
+                self.stop_level = max(self.stop_level, trail)
+            else:
+                self.stop_level = min(self.stop_level, trail)
+
+    def _take_profit_hit(self, idx: int) -> bool:
+        if self.take_profit_level is None or not self.is_active_position:
+            return False
+        if self.position_direction == 1:
+            high = max(self.prices[idx], self.highs[idx]) if self.highs is not None else self.prices[idx]
+            return high >= self.take_profit_level
+        low = min(self.prices[idx], self.lows[idx]) if self.lows is not None else self.prices[idx]
+        return low <= self.take_profit_level
+
+    def _take_profit_fill_price(self, idx: int) -> float:
+        """Take-profit level, or the open when the candle gapped beyond it (better fill)."""
+        tp = float(self.take_profit_level)
+        if self.opens is None:
+            return tp
+        candle_open = float(self.opens[idx])
+        if self.position_direction == 1 and candle_open > tp:
+            return candle_open
+        if self.position_direction == -1 and candle_open < tp:
+            return candle_open
+        return tp
 
     def _stop_breached(self, idx: int) -> bool:
         """True if candle `idx` traded through the stop price (intra-candle when high/low are known)."""
@@ -477,19 +579,42 @@ class ConstrainedTradingEnv(gym.Env):
         next_ts = self.dates[self.current_step]
         self._mark_to_market(price_next)
 
-        # 5. In-trade risk rules at the new bar
+        # 5. In-trade risk rules at the new bar (stop checked before take-profit: conservative)
         new_day = next_ts.date() != self.current_date
+        trailing_stop_hit = take_profit_hit = daily_cap_hit = False
         if self.is_active_position:
+            idx = self.current_step
             if new_day:
                 # Safety: never carry an intraday position overnight
                 closed_trade_pnls.append(self._close_position(price_next))
-            elif self._stop_breached(self.current_step):
-                # Exit at the stop price, or at the open if the candle gapped through it
-                closed_trade_pnls.append(self._close_position(self._stop_fill_price(self.current_step)))
-                stop_loss_hit = True
-                self.locked_out_for_day = True
+            elif self._stop_breached(idx):
+                # Exit at the stop, or at the open if the candle gapped through it
+                trade_pnl = self._close_position(self._stop_fill_price(idx))
+                closed_trade_pnls.append(trade_pnl)
+                if trade_pnl < 0.0:
+                    stop_loss_hit = True
+                    self.locked_out_for_day = True  # losing stop -> done for the day
+                else:
+                    trailing_stop_hit = True  # trailed stop locked in a gain
+            elif self._take_profit_hit(idx):
+                closed_trade_pnls.append(self._close_position(self._take_profit_fill_price(idx)))
+                take_profit_hit = True
             elif next_ts.time() >= self.auto_square_off_time:
                 closed_trade_pnls.append(self._close_position(price_next))
+            else:
+                self._update_trailing_stop(idx)
+
+        # 5b. Daily loss cap on mark-to-market equity
+        if (
+            not new_day
+            and self.daily_loss_limit is not None
+            and not self.locked_out_for_day
+            and self.equity <= self.day_start_equity * (1.0 - self.daily_loss_limit)
+        ):
+            if self.is_active_position:
+                closed_trade_pnls.append(self._close_position(price_next))
+            self.locked_out_for_day = True
+            daily_cap_hit = True
 
         # 6. Date rollover: reset daily counters for the new session
         self.unique_dates_seen.add(next_ts.date())
@@ -497,6 +622,7 @@ class ConstrainedTradingEnv(gym.Env):
             self.current_date = next_ts.date()
             self.daily_trades_count = 0
             self.locked_out_for_day = False
+            self.day_start_equity = self.equity
 
         # 7. Single unbroken episode: terminate only at the last bar
         terminated = self.current_step >= self.num_rows - 1
@@ -516,6 +642,9 @@ class ConstrainedTradingEnv(gym.Env):
             stop_loss_hit=stop_loss_hit,
         )
         info["action"] = float(act_val)
+        info["trailing_stop_hit"] = trailing_stop_hit
+        info["take_profit_hit"] = take_profit_hit
+        info["daily_cap_hit"] = daily_cap_hit
         return self._get_observation(), step_net_pnl, terminated, truncated, info
 
     def _build_info(
@@ -549,6 +678,9 @@ class ConstrainedTradingEnv(gym.Env):
             "trade_closed": bool(closed_trade_pnls),
             "trade_closed_profit": bool(any(p > 0.0 for p in closed_trade_pnls)),
             "stop_loss_hit": bool(stop_loss_hit),
+            "trailing_stop_hit": False,
+            "take_profit_hit": False,
+            "daily_cap_hit": False,
             "locked_out_for_day": bool(self.locked_out_for_day),
             "bars_held": int(self.bars_held),
             "exit_blocked": bool(self.exit_blocked),
