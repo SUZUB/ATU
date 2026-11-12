@@ -49,6 +49,7 @@ try:
     )
     from constrained_trading_env import ConstrainedTradingEnv
     from src.data_processing import SentimentProcessor, load_archive_headlines
+    from research_strategies import session_features_for_state
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from market_data_processor import (
@@ -61,6 +62,7 @@ except ImportError:
     )
     from constrained_trading_env import ConstrainedTradingEnv
     from src.data_processing import SentimentProcessor, load_archive_headlines
+    from research_strategies import session_features_for_state
 
 
 # =====================================================================
@@ -339,6 +341,16 @@ def _score_recent_news(
     return headlines, sentiment_df
 
 
+def _with_session_features(market_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds causal intraday-structure features (research_strategies.SESSION_FEATURE_COLUMNS):
+    overnight gap, first-bar return from the previous close, log relative opening volume,
+    distance from session VWAP, position inside the opening range and day-to-date return.
+    """
+    feats = session_features_for_state(raw_df).reindex(market_df.index).fillna(0.0)
+    return market_df.join(feats)
+
+
 def build_live_state_vector(
     ticker: str = "AAPL",
     period: str = DEFAULT_PERIOD,
@@ -363,7 +375,7 @@ def build_live_state_vector(
     print(f"\n[Data 1/3] Downloading real {interval} candles for {ticker} (period={period})...")
     market_processor = MarketDataProcessor()  # scaler fit on the first 80% only
     raw_df = market_processor.fetch_data(ticker=ticker, period=period, interval=interval)
-    market_df = market_processor.process_dataframe(raw_df)
+    market_df = _with_session_features(market_processor.process_dataframe(raw_df), raw_df)
     exchange_tz = market_df.index.tz
     bar_dates = pd.Series(market_df.index.date)
     bars_per_day = int(bar_dates.value_counts().median())
@@ -399,7 +411,8 @@ def build_live_state_vector(
 
     # Mirrored copy (every return negated, sentiment negated) with its own leak-free scaler
     mirror_processor = MarketDataProcessor(train_ratio=market_processor.train_ratio)
-    mirror_market = mirror_processor.process_dataframe(mirror_ohlcv(raw_df))
+    mirror_raw = mirror_ohlcv(raw_df)
+    mirror_market = _with_session_features(mirror_processor.process_dataframe(mirror_raw), mirror_raw)
     mirror_sentiment = None
     if sentiment_df is not None and not sentiment_df.empty:
         mirror_sentiment = sentiment_df.assign(daily_sentiment=-sentiment_df["daily_sentiment"])

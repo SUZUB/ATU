@@ -20,6 +20,7 @@ XD/
 ├── sentiment_processor.py      # File 2: FinBERT scoring
 ├── constrained_trading_env.py  # File 3: Gymnasium trading environment
 ├── train_and_backtest.py       # File 4: CLI entry point (thin wrapper over src/train.py)
+├── research_strategies.py      # Rule-based 5-min Opening Range Breakout (paper-based), edge check
 └── requirements.txt
 ```
 
@@ -133,6 +134,7 @@ Key CLI options (`python train_and_backtest.py --help`):
 3. **Cell 2** imports the shared pipeline.
 4. **Cell 3** builds the real-data state vector. Change `TICKER`, `INTERVAL`, `PERIOD` here.
 5. **Cell 4** trains one PPO + A2C ensemble per seed (`SEEDS`, `TRAIN_PASSES`), backtests each and prints the per-seed reports and the cross-seed summary.
+6. **Cell 5** runs the rule-based 5-minute Opening Range Breakout on a stock universe (no RL) and saves `results/research/`.
 
 Equivalent CLI inside Colab:
 ```bash
@@ -148,3 +150,30 @@ Each seed's report includes net/gross P&L, fees, trade-level win rate and profit
 The **seed summary** compares the seeds: a real edge is profitable in most seeds and holds up across sub-windows; one good seed is luck.
 
 **Caveat:** with 1h bars the test window is ~145 trading days; with 5m bars (60 days max) it is only ~12 days and results are anecdotal. Past backtests do not guarantee future profit.
+
+---
+
+## 8. Research Strategy: 5-Minute Opening Range Breakout (`research_strategies.py`)
+
+Rule-based, parameters taken from the papers (nothing tuned on our data):
+
+- **ORB** - Zarattini & Aziz (2023), *Can Day Trading Really Be Profitable?*, SSRN 4416622: the first 5-minute candle sets the direction (green -> long, red -> short, doji -> none); entry at the next bar's open; stop at the other side of the opening range; exit at **3R (1:3 risk:reward)** or the session close. Each trade risks 1% of its capital share, leverage capped at 4x.
+- **Stocks in Play** filter - Zarattini, Barbon & Aziz (2024), SFI RP 24-98: trade only the top-N stocks by relative opening volume (`top_n`).
+- **Intraday momentum** - Gao, Han, Li & Zhou (2018), *JFE* 129(2): first-bar return from the previous close predicts the last half hour.
+- **Edge check** - rank correlation of opening features with the rest-of-day return, train vs. test.
+
+```powershell
+python research_strategies.py --fee 0.0001          # 13 US stocks, 5m bars, 1:3 RR
+python research_strategies.py --tickers RELIANCE.NS TCS.NS INFY.NS --fee 0.0002
+```
+
+What we found (Nov 2026, 12-13 large US stocks):
+
+| Test | Result |
+| :--- | :--- |
+| 1-hour opening range, 2 years | Loses even before fees in the test period - a 60-minute range is too slow |
+| Intraday momentum, 2 years | Loses before fees |
+| **5-minute ORB 1:3, last 60 days** | **+1% to +6% net at 0.003-0.01% fees per side, ~-2% at 0.03%**; profitable second half, slightly negative first half |
+| RL agents (Cells 3-4), 2 years | Learn to stay flat: indicators alone do not beat fees |
+
+Costs decide the outcome: the paper assumes ~0.002% per side. Yahoo serves only 60 days of 5-minute bars, so every run **merges new bars into `datasets/intraday/`** and the out-of-sample record grows over time. Trust the strategy only when both halves stay positive at your real costs, and paper-trade it before risking money.
