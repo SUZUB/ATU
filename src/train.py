@@ -13,7 +13,7 @@ Flow:
 3. Leak-free features (scaler fit on the first 80%) -> chronological 80/20 split.
 4. PPO + A2C trained on VecNormalize'd (reward-only) envs in chunks, with model
    and normalization stats checkpointed to the workspace after every chunk.
-5. Consensus walk-forward backtest on a raw env (unscaled rupee P&L).
+5. Confidence-gated ensemble backtest on a raw env (unscaled P&L), per seed.
 
 Workspace layout (local folder or Google Drive):
     <workspace>/datasets/        news cache, optional archive CSVs
@@ -99,6 +99,11 @@ def session_rules(ticker: str) -> Dict[str, dtime]:
         return dict(session_start_time=dtime(9, 15), session_end_time=dtime(15, 30), auto_square_off_time=dtime(15, 15))
     # US equities, America/New_York
     return dict(session_start_time=dtime(9, 30), session_end_time=dtime(16, 0), auto_square_off_time=dtime(15, 45))
+
+
+def currency_symbol(ticker: str) -> str:
+    """Display currency for amounts: rupees for NSE/BSE symbols, dollars otherwise."""
+    return "\u20b9" if is_indian_ticker(ticker) else "$"
 
 
 def interval_rules(interval: str) -> Dict[str, int]:
@@ -542,7 +547,7 @@ def train_ensemble(
 
 
 # =====================================================================
-# 5. Consensus walk-forward backtest (raw rupee P&L)
+# 5. Confidence-gated ensemble backtest (raw P&L)
 # =====================================================================
 @dataclass
 class BacktestResult:
@@ -631,7 +636,7 @@ def run_ensemble_backtest(
 ) -> BacktestResult:
     """
     Runs the full test horizon on an UN-normalized env, so balances, fees and P&L are
-    real rupees. Training used norm_obs=False, so agents consume raw observations.
+    real currency. Training used norm_obs=False, so agents consume raw observations.
     Trades follow `ensemble_decision` (confident joint entries, hold while supported).
     Records each agent's signal mix and warns when a policy has collapsed to one signal.
     """
@@ -691,6 +696,7 @@ def run_ensemble_backtest(
     metrics["avg_win_trade"] = float(np.mean(wins)) if wins else 0.0
     metrics["avg_loss_trade"] = float(np.mean(losses)) if losses else 0.0
     metrics["ticker"] = ticker
+    metrics["currency"] = currency_symbol(ticker)
     metrics["test_start"] = str(test_df.index[0])
     metrics["test_end"] = str(test_df.index[-1])
     metrics["total_steps"] = len(result.step_returns)
@@ -717,21 +723,22 @@ def format_report(metrics: Dict[str, Any]) -> str:
     windows = metrics.get("windows", [])
     windows_won = sum(w["return_pct"] > 0 for w in windows)
     windows_text = ", ".join("{:+.2f}%".format(w["return_pct"]) for w in windows)
+    c = metrics.get("currency", "$")
     return "\n".join([
         "=" * 65,
         "      ENSEMBLE (PPO + A2C) INSTITUTIONAL PERFORMANCE REPORT    ",
         "=" * 65,
         f" Ticker / Test Window:     {metrics['ticker']} | {metrics['test_start'][:10]} -> {metrics['test_end'][:10]}",
-        f" Initial Balance:          ₹{metrics['initial_balance']:,.2f}",
-        f" Final Compounded Balance: ₹{metrics['final_balance']:,.2f}",
-        f" Net Profit (After Fees):  ₹{metrics['net_profit']:+,.2f} ({metrics['net_return_pct']:+.2f}%)",
-        f" Gross Profit (Pre-Fees):  ₹{metrics['gross_profit']:+,.2f} ({metrics['gross_return_pct']:+.2f}%)",
-        f" Total Brokerage & STT:    ₹{metrics['total_fees_paid']:,.2f}",
+        f" Initial Balance:          {c}{metrics['initial_balance']:,.2f}",
+        f" Final Compounded Balance: {c}{metrics['final_balance']:,.2f}",
+        f" Net Profit (After Fees):  {c}{metrics['net_profit']:+,.2f} ({metrics['net_return_pct']:+.2f}%)",
+        f" Gross Profit (Pre-Fees):  {c}{metrics['gross_profit']:+,.2f} ({metrics['gross_return_pct']:+.2f}%)",
+        f" Total Fees & Charges:     {c}{metrics['total_fees_paid']:,.2f}",
         f" Closed Trades:            {metrics['total_trades']:,} (Win Rate: {metrics['win_rate_pct']:.1f}%, "
         f"Stop-Loss Exits: {metrics['stop_loss_exits']})",
         f" Exits: Trail / TP / Cap:  {metrics.get('trailing_stop_exits', 0)} / {metrics.get('take_profit_exits', 0)} / "
         f"{metrics.get('daily_loss_cap_hits', 0)}   Avg Win / Loss Trade: "
-        f"₹{metrics.get('avg_win_trade', 0.0):+,.2f} / ₹{metrics.get('avg_loss_trade', 0.0):+,.2f}",
+        f"{c}{metrics.get('avg_win_trade', 0.0):+,.2f} / {c}{metrics.get('avg_loss_trade', 0.0):+,.2f}",
         f" Maximum Drawdown:         {metrics['max_drawdown_pct']:.2f}%",
         f" Sharpe Ratio (Ann.):      {metrics['sharpe_ratio']:.4f}",
         f" Sortino Ratio (Ann.):     {metrics['sortino_ratio']:.4f}",
@@ -742,8 +749,8 @@ def format_report(metrics: Dict[str, Any]) -> str:
         f" Trading Days:             {metrics.get('days_total', 0)} (green {metrics.get('days_green', 0)} | "
         f"red {metrics.get('days_red', 0)} | flat {metrics.get('days_flat', 0)})",
         f" Green-Day Rate:           {metrics.get('green_day_rate_pct', 0.0):.1f}% of days with a trade",
-        f" Avg Green / Red Day:      ₹{metrics.get('avg_green_day', 0.0):+,.2f} / ₹{metrics.get('avg_red_day', 0.0):+,.2f}",
-        f" Best / Worst Day:         ₹{metrics.get('best_day', 0.0):+,.2f} / ₹{metrics.get('worst_day', 0.0):+,.2f}",
+        f" Avg Green / Red Day:      {c}{metrics.get('avg_green_day', 0.0):+,.2f} / {c}{metrics.get('avg_red_day', 0.0):+,.2f}",
+        f" Best / Worst Day:         {c}{metrics.get('best_day', 0.0):+,.2f} / {c}{metrics.get('worst_day', 0.0):+,.2f}",
         f" Sub-Windows Profitable:   {windows_won}/{len(windows)}  [{windows_text}]",
         "-" * 65,
         " Signal Mix (short / flat / long):",
@@ -784,13 +791,14 @@ def save_backtest_results(result: BacktestResult, results_dir: str, show_plot: b
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(12, 5))
-    plt.plot(result.portfolio_values, color="#2563EB", linewidth=1.8, label="Ensemble Portfolio Equity (₹)")
+    c = currency_symbol(result.ticker)
+    plt.plot(result.portfolio_values, color="#2563EB", linewidth=1.8, label=f"Ensemble Portfolio Equity ({c})")
     if result.benchmark_values:
         plt.plot(result.benchmark_values, color="#F59E0B", linewidth=1.2, alpha=0.8, label="Buy & Hold")
     plt.axhline(result.initial_balance, color="gray", linestyle="--", alpha=0.7, label="Initial Capital")
     plt.title(f"ATU Multi-Agent Ensemble Out-of-Sample Equity Curve ({result.ticker})", fontsize=13)
-    plt.xlabel("Intraday 5-Min Steps", fontsize=11)
-    plt.ylabel("Portfolio Balance (₹)", fontsize=11)
+    plt.xlabel("Test Bars", fontsize=11)
+    plt.ylabel(f"Portfolio Equity ({c})", fontsize=11)
     plt.legend(fontsize=10)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -862,7 +870,7 @@ def format_experiment_summary(summary: Dict[str, Any]) -> str:
         lines.append(
             f" {r['seed']:<5} {r['net_return_pct']:+6.2f}%  {r['days_green']:>3}/{r['days_green'] + r['days_red']:<3} "
             f"({r['green_day_rate_pct']:3.0f}%) {r['total_trades']:>5}  {r['max_drawdown_pct']:6.2f}%  {pf:>5}  "
-            f"₹{r['worst_day']:+,.0f}{'  COLLAPSED' if r['collapsed'] else ''}"
+            f"{currency_symbol(summary['ticker'])}{r['worst_day']:+,.0f}{'  COLLAPSED' if r['collapsed'] else ''}"
         )
     lines += [
         "-" * 65,
@@ -938,7 +946,7 @@ def run_experiment(
     plt.axhline(first.initial_balance, color="gray", linestyle="--", alpha=0.7, label="Initial Capital")
     plt.title(f"ATU Ensemble Out-of-Sample Equity by Seed ({data.ticker})", fontsize=13)
     plt.xlabel("Test Bars", fontsize=11)
-    plt.ylabel("Portfolio Equity (₹)", fontsize=11)
+    plt.ylabel(f"Portfolio Equity ({currency_symbol(data.ticker)})", fontsize=11)
     plt.legend(fontsize=9)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

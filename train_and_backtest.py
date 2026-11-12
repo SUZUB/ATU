@@ -4,15 +4,15 @@ train_and_backtest.py (File 4)
 CLI entry point for the ATU pipeline. All logic lives in `src/train.py`, which the
 Colab notebook (`ATU_GPU.ipynb`) also calls, so the CLI and notebook stay identical:
 
-    real yfinance 5-min candles + real news (FinBERT, 1-day lag)
+    real yfinance candles (default 1h, ~2y) + real news (FinBERT, 1-day lag)
     -> leak-free features -> 80/20 split
-    -> PPO + A2C on VecNormalize'd rewards (chunked, resumable checkpoints)
-    -> consensus walk-forward backtest in unscaled rupees
+    -> PPO + A2C per seed on original + mirrored data (shaped, normalized rewards)
+    -> confidence-gated ensemble backtest per seed (unscaled P&L, $ or ₹ by ticker)
 
 Examples:
-    python train_and_backtest.py --ticker AAPL --timesteps 500000
+    python train_and_backtest.py --ticker AAPL
     python train_and_backtest.py --ticker RELIANCE.NS --workspace /content/drive/MyDrive/ATU_Workspace
-    python train_and_backtest.py --timesteps 4096 --chunks 2 --no-tensorboard   # smoke test
+    python train_and_backtest.py --passes 1 --seeds 0 --no-news   # smoke test
 """
 
 from src.train import (  # noqa: F401  (re-exported for backward compatibility)
