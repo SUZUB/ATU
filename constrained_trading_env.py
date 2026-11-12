@@ -17,10 +17,12 @@ Design (v4):
    (action > +threshold -> Long, < -threshold -> Short, else Flat).
    Position size is fixed at entry and never resized while held. Brokerage is
    charged only on entry and exit legs (a flip = exit + entry).
-3. Reward = net profit of the step in currency:
-   (equity after step) - (equity before step), where equity = cash + mark-to-market
-   of the open position. Fees are already deducted from cash, so they are included.
-   No multipliers, no clipping.
+3. Reward (reward_mode="shaped", default), in currency:
+   step net P&L (equity change incl. fees)
+   - 0.5 x each deepening of the day's maximum drawdown below its peak equity
+   +/- 0.05% of the day's starting equity when a day closes green / red (0 if flat).
+   Staying flat is free. reward_mode="pnl" gives the plain step net P&L. The info
+   dict always reports the true P&L (`step_net_pnl`), so backtests are unaffected.
 4. Risk & sizing:
    1R (initial stop distance) = 2 x ATR(14) / price, clipped to [0.3%, 2%] (fixed
    |loss_limit| during ATR warm-up). Notional = equity * max_risk_per_trade / 1R, capped
@@ -127,6 +129,9 @@ class ConstrainedTradingEnv(gym.Env):
         trail_distance_r: float = 1.0,
         take_profit_r: Optional[float] = 3.0,
         daily_loss_limit: Optional[float] = 0.01,
+        reward_mode: str = "shaped",
+        drawdown_penalty: float = 0.5,
+        day_result_bonus: float = 0.0005,
     ) -> None:
         """
         Args:
@@ -162,6 +167,11 @@ class ConstrainedTradingEnv(gym.Env):
             take_profit_r: Close the trade at entry +/- this many R. None disables it.
             daily_loss_limit: Close and lock out for the day once equity falls this
                 fraction below the day's starting equity. None disables it.
+            reward_mode: "shaped" (default) or "pnl" (reward = step net P&L only).
+            drawdown_penalty: Shaped mode: extra penalty per unit by which the day's
+                maximum drawdown (below the day's peak equity) deepens.
+            day_result_bonus: Shaped mode: at each day's close, +/- this fraction of the
+                day's starting equity for a green / red day (0 for a flat day).
         """
         super().__init__()
 
@@ -210,6 +220,11 @@ class ConstrainedTradingEnv(gym.Env):
             raise ValueError("Require 0 < min_stop_pct <= max_stop_pct")
         if self.max_position_leverage <= 0.0:
             raise ValueError("max_position_leverage must be positive")
+        if reward_mode not in ("shaped", "pnl"):
+            raise ValueError(f"reward_mode must be 'shaped' or 'pnl', got {reward_mode!r}")
+        self.reward_mode: str = reward_mode
+        self.drawdown_penalty: float = float(drawdown_penalty)
+        self.day_result_bonus: float = float(day_result_bonus)
 
         # Unscaled price series for all accounting
         if raw_price_col in self.df.columns:
@@ -307,6 +322,8 @@ class ConstrainedTradingEnv(gym.Env):
         self.last_action: float = 0.0
         self.bars_since_exit: int = 10**9  # no exit yet -> no cooldown
         self.day_start_equity: float = self.initial_balance
+        self.day_peak_equity: float = self.initial_balance
+        self.day_max_drawdown: float = 0.0  # deepest drop below the day's peak so far (currency)
         self._clear_position()
 
     def _clear_position(self) -> None:
@@ -616,23 +633,41 @@ class ConstrainedTradingEnv(gym.Env):
             self.locked_out_for_day = True
             daily_cap_hit = True
 
-        # 6. Date rollover: reset daily counters for the new session
+        # 6. Date rollover: score the finished day, then reset daily counters
+        terminated = self.current_step >= self.num_rows - 1
+        if terminated and self.is_active_position:
+            closed_trade_pnls.append(self._close_position(price_next))
+        day_closed_pnl: Optional[float] = None
+        day_base = self.day_start_equity
+        if new_day or terminated:
+            day_closed_pnl = self.equity - day_base
+        drawdown_now = max(self.day_peak_equity, self.equity) - self.equity
+        new_drawdown = 0.0 if new_day else max(0.0, drawdown_now - self.day_max_drawdown)
         self.unique_dates_seen.add(next_ts.date())
         if new_day:
             self.current_date = next_ts.date()
             self.daily_trades_count = 0
             self.locked_out_for_day = False
             self.day_start_equity = self.equity
+            self.day_peak_equity = self.equity
+            self.day_max_drawdown = 0.0
+        else:
+            self.day_peak_equity = max(self.day_peak_equity, self.equity)
+            self.day_max_drawdown = max(self.day_max_drawdown, drawdown_now)
 
-        # 7. Single unbroken episode: terminate only at the last bar
-        terminated = self.current_step >= self.num_rows - 1
+        # 7. Single unbroken episode: terminates only at the last bar (handled above)
         truncated = False
-        if terminated and self.is_active_position:
-            closed_trade_pnls.append(self._close_position(price_next))
 
-        # 8. Reward = net currency profit of this step (fees included)
+        # 8. Reward: net currency profit of this step (fees included), plus shaping
         step_net_pnl = float(self.equity - equity_before)
         step_return = step_net_pnl / equity_before if equity_before > 0.0 else 0.0
+        reward = step_net_pnl
+        shaping = 0.0
+        if self.reward_mode == "shaped":
+            shaping -= self.drawdown_penalty * new_drawdown  # only when the day's worst drawdown deepens
+            if day_closed_pnl is not None and abs(day_closed_pnl) > 0.01:
+                shaping += float(np.sign(day_closed_pnl)) * self.day_result_bonus * max(day_base, 0.0)
+            reward += shaping
         self.last_action = act_val
 
         info = self._build_info(
@@ -642,10 +677,12 @@ class ConstrainedTradingEnv(gym.Env):
             stop_loss_hit=stop_loss_hit,
         )
         info["action"] = float(act_val)
+        info["reward_shaping"] = float(shaping)
+        info["day_closed_pnl"] = day_closed_pnl
         info["trailing_stop_hit"] = trailing_stop_hit
         info["take_profit_hit"] = take_profit_hit
         info["daily_cap_hit"] = daily_cap_hit
-        return self._get_observation(), step_net_pnl, terminated, truncated, info
+        return self._get_observation(), float(reward), terminated, truncated, info
 
     def _build_info(
         self,
@@ -743,4 +780,4 @@ if __name__ == "__main__":
 
     print(f"\nSteps: {step_idx} | Days: {step_info['days_processed']} | Trades: {step_info['total_trades']}")
     print(f"Fees: {step_info['total_fees_paid']:,.2f} | Final equity: {step_info['equity']:,.2f}")
-    print(f"Sum of rewards: {total_reward:,.2f} == net P&L: {step_info['equity'] - env.initial_balance:,.2f}")
+    print(f"Sum of shaped rewards: {total_reward:,.2f} | net P&L: {step_info['equity'] - env.initial_balance:,.2f}")
