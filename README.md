@@ -21,7 +21,10 @@ XD/
 ├── constrained_trading_env.py  # File 3: Gymnasium trading environment
 ├── train_and_backtest.py       # File 4: CLI entry point (thin wrapper over src/train.py)
 ├── research_strategies.py      # Rule-based 5-min Opening Range Breakout (paper-based), edge check
-├── orb_model.py                # Trained + saved ORB model (learns which ORB trades to take)
+├── orb_model.py                # ORB v2: 5 variants, walk-forward, verdict, saved model, live signals
+├── orb_eval.py                 # Block bootstrap, Deflated Sharpe, random-direction test, break-even fee
+├── alpaca_data.py              # Years of 5-min bars from Alpaca (incremental Drive cache)
+├── tests/test_orb_v2.py        # Offline tests (no network)
 └── requirements.txt
 ```
 
@@ -136,7 +139,7 @@ Key CLI options (`python train_and_backtest.py --help`):
 4. **Cell 3** builds the real-data state vector. Change `TICKER`, `INTERVAL`, `PERIOD` here.
 5. **Cell 4** trains one PPO + A2C ensemble per seed (`SEEDS`, `TRAIN_PASSES`), backtests each and prints the per-seed reports and the cross-seed summary.
 6. **Cell 5** runs the rule-based 5-minute Opening Range Breakout on a stock universe (no RL) and saves `results/research/`.
-7. **Cell 6** loads the saved ORB model from Drive, updates it with new data, saves it again and prints today's signals.
+7. **Cell 6** (ORB v2) downloads/extends years of 5-min bars from Alpaca, runs the walk-forward test of 5 variants, prints the VERDICT, saves the model and prints today's signals.
 
 Equivalent CLI inside Colab:
 ```bash
@@ -195,3 +198,21 @@ First result (40 US stocks, 59 sessions, 39 out-of-sample, 0.01% fees/side): mod
 ```powershell
 python orb_model.py --workspace ATU_Workspace --fee 0.0001
 ```
+
+### 8.2 ORB v2: years of data and honest statistics
+
+Why: ~39 out-of-sample sessions (Yahoo's 60-day limit) cannot separate skill from luck, and independent replications of the ORB paper find a gross edge of roughly +0.13R per trade, about equal to realistic trading costs.
+
+- **Data** (`alpaca_data.py`): 5-minute bars since 2016 from the Alpaca Market Data API (free account; keys `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`). Regular session only (09:30-15:59 ET), split-adjusted, cached incrementally per feed in `datasets/intraday_alpaca_<feed>/` (splits trigger a full re-download; today's running session is never cached). Universe: `LARGE_UNIVERSE`, ~114 liquid US tickers (`--universe large`).
+- **Simulation**: vectorized numpy brackets with fills identical to the reference (stop before target on the same bar, gaps fill at the open). Gross R and a cost unit are stored, so any fee level is evaluated exactly. Default cost **2 bp per side**.
+- **Variants**, all walk-forward on the same unseen sessions: `plain` (paper rule), `sip` (Stocks in Play: top 10% by relative opening volume, fixed in advance), `free` (model picks long/short), `meta` (meta-label: take the plain trade only if predicted net R > +0.10R), `meta_sip`.
+- **Statistics** (`orb_eval.py`): block-bootstrap CI and p(mean <= 0), Deflated Sharpe (5 trials), break-even fee, random-direction test (on a symmetric bracket with the same stop distance long and short, so stop placement cannot fake skill), first/second half, fee grid 1/2/3/5 bp.
+- **Verdict**: `SUPPORTED` only if the best variant has DSR >= 0.95, is profitable at 3 bp per side and positive in both halves; `WEAK` if avg R > 0 with p(mean <= 0) <= 0.10; otherwise `NO EDGE`. Trust the verdict printed from real data, not any single line of the table.
+
+```powershell
+$env:APCA_API_KEY_ID="..."; $env:APCA_API_SECRET_KEY="..."
+python orb_model.py --source alpaca --universe large --start 2016-01-01 --fee 0.0002
+python -m pytest tests/test_orb_v2.py -v      # offline tests
+```
+
+**Live-use caveat:** on the free plan, SIP history is delayed 15 minutes and free real-time data is IEX only (a single exchange with a fraction of the volume). A 09:35 signal computed from free SIP data is therefore not tradable at 09:35, and IEX volumes differ from SIP volumes, so relative-volume features do not transfer between feeds. Train and trade on the same feed. Survivorship bias also applies: the universe is today's liquid names.

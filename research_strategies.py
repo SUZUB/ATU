@@ -404,15 +404,31 @@ def _exchange_tz(ticker: str) -> str:
     return "Asia/Kolkata" if ticker.upper().endswith((".NS", ".BO")) else "America/New_York"
 
 
+def split_incomplete_session(df: pd.DataFrame, close_buffer: str = "16:30",
+                             now: Optional[pd.Timestamp] = None) -> tuple:
+    """
+    Splits off today's still-running session: returns (complete_df, todays_bars_or_None).
+    A session counts as complete once the exchange clock is past `close_buffer`.
+    """
+    if df.empty:
+        return df, None
+    now = pd.Timestamp.now(tz=df.index.tz) if now is None else pd.Timestamp(now).tz_convert(df.index.tz)
+    if df.index[-1].date() == now.date() and now.time() < pd.Timestamp(close_buffer).time():
+        today = df.index.date == now.date()
+        return df[~today], df[today]
+    return df, None
+
+
 def download_universe(tickers: Sequence[str], period: str = "730d", interval: str = "1h",
                       cache_dir: Optional[str] = None, refresh: bool = True,
-                      verbose: bool = True) -> Dict[str, pd.DataFrame]:
+                      verbose: bool = True, keep_incomplete: bool = False) -> Dict[str, pd.DataFrame]:
     """
     Raw OHLCV per ticker. With `cache_dir`, bars are stored in
     <cache_dir>/ohlcv_<TICKER>_<interval>.csv and every fresh download is MERGED into
     that file, so history accumulates beyond Yahoo's limits (5m bars: 60 days) each
     time this runs. `refresh=False` uses the cache only. Failed tickers are skipped.
-    The current (still running) session is dropped so incomplete days never enter a backtest.
+    Today's still-running session is NEVER written to the cache; it is included in the
+    returned frames only when `keep_incomplete=True` (for live signals).
     """
     import os
     proc = MarketDataProcessor()
@@ -435,12 +451,14 @@ def download_universe(tickers: Sequence[str], period: str = "730d", interval: st
             continue
         df = pd.concat(parts)
         df = df[~df.index.duplicated(keep="last")].sort_index()
-        now = pd.Timestamp.now(tz=df.index.tz)
-        if df.index[-1].date() == now.date() and now.time() < pd.Timestamp("16:30").time():
-            df = df[df.index.date != now.date()]  # drop today's incomplete session
-        if path:
+        df, today = split_incomplete_session(df)
+        if path and len(df):
             os.makedirs(cache_dir, exist_ok=True)
             df.to_csv(path)
+        if keep_incomplete and today is not None and len(today):
+            df = pd.concat([df, today])
+        if df.empty:
+            continue
         data[t] = df
         if verbose:
             print(f"  {t:<8} {len(df):>6} bars  {df.index[0].date()} -> {df.index[-1].date()}"
