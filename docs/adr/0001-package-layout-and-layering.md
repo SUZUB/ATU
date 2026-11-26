@@ -22,6 +22,13 @@ evaluation, and it lives in the same repository as the legacy ATU 1 code (ORB v2
 - Allowing peer imports: simpler at first, but cycles creep in (for example training <-> evaluation).
 
 ## Consequences
-- The training loop's early stopping cannot import `evaluation.metrics` (peer layer). The
-  Sharpe computation it needs must live lower (models/losses or core) or be duplicated
-  with a test that both agree. Revisit with an ADR if this becomes awkward in M4.
+- Peers in the same layer cannot share code directly; what they share lives lower.
+
+## Resolution: shared metrics (decided 2026-11-26)
+The strict rule stays (no peer imports). Pure metric functions on return series
+(annualised return and volatility, Sharpe, Sortino, maximum drawdown, hit rate, turnover)
+live in `atu2/core/metrics.py`, the lowest layer. `training` (early stopping on validation
+Sharpe) and `evaluation` (reports, gate) both import them from `core` and never from each
+other. `evaluation` keeps only what needs more than one return series or the gate config
+(bootstrap, deflated Sharpe, placebo, cost sweep, report). This was possible without
+relaxing the rule because the plan's layer order puts `core` below both peers.

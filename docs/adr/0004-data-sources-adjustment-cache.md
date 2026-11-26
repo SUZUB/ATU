@@ -14,9 +14,12 @@ reproducing the paper.
 - Raw files are never edited after download. Derived files carry the hash of their inputs
   in their name. Timestamps are stored in UTC, dates on the exchange calendar.
 - A second free daily-price source cross-checks closes; disagreement above a tolerance fails the build.
-- Keys come only from environment variables (D8). The plan names them `ALPACA_API_KEY` and
-  `ALPACA_API_SECRET`; the legacy ORB v2 code uses `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
-  (open question for M1: accept both or pick one).
+- Keys come only from environment variables (D8). Decided 2026-11-26: both naming schemes
+  are accepted (`atu2/core/credentials.py`). Primary: `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`
+  (Alpaca's own names, also used by ORB v2 and Colab). Aliases: `ALPACA_API_KEY` /
+  `ALPACA_API_SECRET` (the plan's names). If a primary and its alias are both set with
+  different values, `ConflictingCredentialError` is raised; nothing is picked silently.
+  All four names are always redacted from logs and checked by the repository secret scan.
 
 ## Consequences
 - Free data has no delisted funds: survivorship bias is a documented limitation (R10).

@@ -45,3 +45,7 @@ class HoldoutAccessError(ATUError):
 # --- secrets ----------------------------------------------------------------------------
 class MissingSecretError(ATUError):
     """A required key is not set in the environment. Keys are never read from files."""
+
+
+class ConflictingCredentialError(ATUError):
+    """A primary key variable and its alias are both set but hold different values."""

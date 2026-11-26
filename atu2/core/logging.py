@@ -7,8 +7,10 @@ Usage:
     log.info("downloaded", extra={"fields": {"ticker": "SPY", "bars": 5000}})
 
 Every line is one JSON object: ts (UTC, ISO 8601), level, logger, run_id, msg and any
-`fields`. Values that look like API keys, and the values of environment variables whose
-names contain KEY, SECRET, TOKEN or PASSWORD, are replaced by "[REDACTED]" before output.
+`fields`. Values that look like API keys, the values of the four Alpaca credential
+variables (atu2.core.credentials.CREDENTIAL_ENV_VARS, any length), and the values of other
+environment variables whose names contain KEY, SECRET, TOKEN or PASSWORD (8+ characters)
+are replaced by "[REDACTED]" before output.
 """
 
 import json
@@ -19,6 +21,8 @@ import secrets
 import sys
 from datetime import UTC, datetime
 from typing import IO, Any
+
+from atu2.core.credentials import CREDENTIAL_ENV_VARS
 
 ROOT_LOGGER = "atu2"
 REDACTED = "[REDACTED]"
@@ -38,8 +42,13 @@ def new_run_id() -> str:
 
 def _secret_env_values() -> list[str]:
     vals = []
-    for name, value in os.environ.items():
-        if any(m in name.upper() for m in _SECRET_ENV_MARKERS) and len(value) >= _MIN_SECRET_LEN:
+    for name, raw in os.environ.items():
+        value = raw.strip()
+        if not value:
+            continue
+        explicit = name in CREDENTIAL_ENV_VARS  # always redacted, whatever the length
+        heuristic = any(m in name.upper() for m in _SECRET_ENV_MARKERS) and len(value) >= _MIN_SECRET_LEN
+        if explicit or heuristic:
             vals.append(value)
     return sorted(vals, key=len, reverse=True)
 

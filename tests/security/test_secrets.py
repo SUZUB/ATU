@@ -10,13 +10,14 @@ from pathlib import Path
 
 import pytest
 
+from atu2.core.credentials import CREDENTIAL_ENV_VARS
 from atu2.core.logging import KEY_PATTERNS
 
 REPO = Path(__file__).resolve().parents[2]
-# literal values assigned to key variables  # pragma: allowlist secret
-ENV_ASSIGNMENT = re.compile(
-    r"(?:ALPACA_API_(?:KEY|SECRET)|APCA_API_(?:KEY_ID|SECRET_KEY)|NASDAQ_DATA_LINK_API_KEY)\s*[:=]\s*['\"][A-Za-z0-9/+]{12,}['\"]"
-)
+SCANNED_ENV_VARS = (*CREDENTIAL_ENV_VARS, "NASDAQ_DATA_LINK_API_KEY")
+# A literal value (quoted or not, 8+ chars) assigned to one of the key variables, e.g. in a
+# shell export, .env line, YAML or Python. References like $VAR, <placeholder> or getpass() are fine.
+ENV_ASSIGNMENT = re.compile(r"\b(?:" + "|".join(SCANNED_ENV_VARS) + r")\b\s*[:=]\s*['\"]?(?![$<{(])[^'\"\s#,)]{8,}")
 SKIP_SUFFIXES = {".zip", ".png", ".jpg", ".jpeg", ".pdf", ".docx", ".pt", ".pth", ".parquet", ".pkl", ".joblib"}
 
 
@@ -36,10 +37,17 @@ def scan_text(text: str) -> list[str]:
 
 def test_scanner_detects_planted_keys():
     fake_id = "PK" + "Z9" * 9
-    fake_secret = "ALPACA_API_SECRET = '" + "Ab1" * 10 + "'"
     assert scan_text(f"key = {fake_id}")
-    assert scan_text(fake_secret)
     assert not scan_text("key = os.environ['ALPACA_API_KEY']")
+
+
+@pytest.mark.parametrize("name", ["APCA_API_KEY_ID", "APCA_API_SECRET_KEY", "ALPACA_API_KEY", "ALPACA_API_SECRET"])
+def test_scanner_covers_all_four_credential_names(name):
+    value = "Ab1-" + "x9" * 8
+    for line in (f"{name} = '{value}'", f'export {name}="{value}"', f"{name}={value}", f"{name}: {value}"):
+        assert scan_text(line), line
+    for safe in (f"export {name}=$SOMETHING", f"{name}=<your key>", f'os.environ["{name}"] = getpass()', f'"{name}",'):
+        assert not scan_text(safe), safe
 
 
 def test_no_key_patterns_in_tracked_files():

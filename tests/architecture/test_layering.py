@@ -151,6 +151,7 @@ def _make_pkg(tmp_path: Path, files: dict[str, str]) -> Path:
         ({"backtest/x.py": "from ..evaluation import metrics\n"}, "upward import backtest -> evaluation"),
         ({"backtest/x.py": "from atu2.models.losses import f\n"}, "peer import backtest -> models"),
         ({"training/x.py": "from atu2 import cli\n"}, "upward import training -> cli"),
+        ({"training/x.py": "from atu2.evaluation.metrics import sharpe\n"}, "peer import training -> evaluation"),
         ({"features/x.py": "import orb_eval\n"}, "legacy module"),
         ({"core/x.py": "from atu2 import __version__\n"}, "package root"),
         ({"__init__.py": "from atu2.core import errors\n"}, "package root may not import"),
