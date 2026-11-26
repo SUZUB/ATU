@@ -45,8 +45,8 @@ data/raw/
 *.pth
 *.bin
 *.onnx
-checkpoints/
-models/
+/checkpoints/
+/models/
 
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/
@@ -72,3 +72,15 @@ desktop.ini
 *.token
 credentials.json
 
+
+# ATU 2 local state (never committed)
+/data/
+/runs/
+/ref/
+holdout_unlock.txt
+.coverage
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/

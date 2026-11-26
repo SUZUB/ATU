@@ -1,3 +1,34 @@
+# ATU 2 (in progress): cost-aware daily trend following
+
+ATU 2 is a new package, `atu2/`, built milestone by milestone from [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md).
+Its single question: does a cost-aware Momentum Transformer-style model earn a positive net Sharpe ratio at
+1 to 3 bps on data it has never seen? The rules for working on it are in [CLAUDE.md](CLAUDE.md), and the
+decisions are in [docs/adr/](docs/adr/). It is research and paper trading only. It does not touch the legacy
+ATU 1 code described further down.
+
+**Status:** M0 (foundation). This covers the core layer: config, hashing, logging, calendar and errors. It also
+includes the layering test, the synthetic markets, the frozen gate config and CI. There is no data or model
+code yet.
+
+### Quickstart (Python 3.11+)
+
+```bash
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements-lock.txt                   # pinned, Python 3.11 lock
+pip install -e . --no-deps
+pre-commit install                                     # secret scan + ruff on every commit
+
+ruff check . && ruff format --check .                  # lint
+mypy atu2                                              # types (strict)
+pytest -q --cov=atu2                                   # tests, coverage gate 85 %
+python scripts/gate_hash.py                            # frozen gate hash check
+```
+
+The legacy ORB v2 test is slow and is excluded from the default run. To run it on its own:
+`pytest tests/test_orb_v2.py -o addopts=""`.
+
+---
+
 # ATU - Automated Trading Unit: Intraday Reinforcement Learning System
 
 An intraday RL trading system built with **Stable-Baselines3 (PPO + A2C ensemble)**, **Gymnasium**, and **FinBERT** news sentiment. It trains on **real candles** (yfinance; default 1-hour bars over ~2 years) and **real headlines** (Google News RSS + yfinance news), with realistic intraday frictions and risk controls: square-off before the close, ATR-based stops with volatility sizing, trailing stop / take-profit, a daily loss cap, a 3-trade daily cap and per-leg fees.
