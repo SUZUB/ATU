@@ -1,0 +1,72 @@
+# ATU 2 universe (FR-03, ADR 0005). STATUS: proposed - awaiting confirmation before any backtest.
+# The rule and the candidate list are fixed here BEFORE any backtest runs (risk R10).
+# After the holdout is opened, changing this file is not allowed (change control).
+#
+# Inception dates are the funds' launch dates as known when this list was written; they are
+# not verified yet. `atu2 data universe-check` re-checks them against the downloaded data.
+status: proposed
+
+rule:
+  # Applied as of this fixed date (never "today"), so the list cannot drift.
+  as_of: "2026-11-26"
+  # Fund history needed (years between inception and as_of).
+  min_history_years: 12.0
+  # Median daily dollar volume (close x volume, raw prices) over the lookback, in USD.
+  min_median_dollar_volume: 20000000.0
+  volume_lookback_days: 252
+  # An asset is tradable only after this many trading days of history (excluded until day 253).
+  warm_up_days: 252
+  # Every one of these classes must keep at least one asset.
+  required_asset_classes:
+    [us_equity, us_sector, intl_equity, govt_bond, credit, gold_silver, commodity, real_estate, currency]
+
+candidates:
+  # --- broad US equity
+  - {ticker: SPY, asset_class: us_equity, inception: "1993-01-22", name: SPDR S&P 500}
+  - {ticker: QQQ, asset_class: us_equity, inception: "1999-03-10", name: Invesco QQQ (Nasdaq-100)}
+  - {ticker: IWM, asset_class: us_equity, inception: "2000-05-22", name: iShares Russell 2000}
+  - {ticker: DIA, asset_class: us_equity, inception: "1998-01-14", name: SPDR Dow Jones Industrial Average}
+  # --- US sectors
+  - {ticker: XLB, asset_class: us_sector, inception: "1998-12-16", name: Materials Select Sector SPDR}
+  - {ticker: XLE, asset_class: us_sector, inception: "1998-12-16", name: Energy Select Sector SPDR}
+  - {ticker: XLF, asset_class: us_sector, inception: "1998-12-16", name: Financial Select Sector SPDR}
+  - {ticker: XLI, asset_class: us_sector, inception: "1998-12-16", name: Industrial Select Sector SPDR}
+  - {ticker: XLK, asset_class: us_sector, inception: "1998-12-16", name: Technology Select Sector SPDR}
+  - {ticker: XLP, asset_class: us_sector, inception: "1998-12-16", name: Consumer Staples Select Sector SPDR}
+  - {ticker: XLU, asset_class: us_sector, inception: "1998-12-16", name: Utilities Select Sector SPDR}
+  - {ticker: XLV, asset_class: us_sector, inception: "1998-12-16", name: Health Care Select Sector SPDR}
+  - {ticker: XLY, asset_class: us_sector, inception: "1998-12-16", name: Consumer Discretionary Select Sector SPDR}
+  # --- international equity
+  - {ticker: EFA, asset_class: intl_equity, inception: "2001-08-14", name: iShares MSCI EAFE}
+  - {ticker: EEM, asset_class: intl_equity, inception: "2003-04-07", name: iShares MSCI Emerging Markets}
+  - {ticker: EWJ, asset_class: intl_equity, inception: "1996-03-12", name: iShares MSCI Japan}
+  - {ticker: EWZ, asset_class: intl_equity, inception: "2000-07-10", name: iShares MSCI Brazil}
+  - {ticker: FXI, asset_class: intl_equity, inception: "2004-10-05", name: iShares China Large-Cap}
+  - {ticker: VGK, asset_class: intl_equity, inception: "2005-03-04", name: Vanguard FTSE Europe}
+  # --- US Treasuries and inflation-linked
+  - {ticker: SHY, asset_class: govt_bond, inception: "2002-07-22", name: iShares 1-3 Year Treasury}
+  - {ticker: IEI, asset_class: govt_bond, inception: "2007-01-05", name: iShares 3-7 Year Treasury}
+  - {ticker: IEF, asset_class: govt_bond, inception: "2002-07-22", name: iShares 7-10 Year Treasury}
+  - {ticker: TLT, asset_class: govt_bond, inception: "2002-07-22", name: iShares 20+ Year Treasury}
+  - {ticker: TIP, asset_class: govt_bond, inception: "2003-12-04", name: iShares TIPS Bond}
+  # --- credit and aggregate
+  - {ticker: AGG, asset_class: credit, inception: "2003-09-22", name: iShares Core US Aggregate Bond}
+  - {ticker: LQD, asset_class: credit, inception: "2002-07-22", name: iShares Investment Grade Corporate}
+  - {ticker: HYG, asset_class: credit, inception: "2007-04-04", name: iShares High Yield Corporate}
+  - {ticker: EMB, asset_class: credit, inception: "2007-12-17", name: iShares JP Morgan USD Emerging Markets Bond}
+  # --- gold and silver
+  - {ticker: GLD, asset_class: gold_silver, inception: "2004-11-18", name: SPDR Gold Shares}
+  - {ticker: SLV, asset_class: gold_silver, inception: "2006-04-21", name: iShares Silver Trust}
+  # --- oil and broad commodities
+  - {ticker: USO, asset_class: commodity, inception: "2006-04-10", name: United States Oil Fund}
+  - {ticker: DBC, asset_class: commodity, inception: "2006-02-03", name: Invesco DB Commodity Index}
+  - {ticker: UNG, asset_class: commodity, inception: "2007-04-18", name: United States Natural Gas Fund}
+  - {ticker: DBA, asset_class: commodity, inception: "2007-01-05", name: Invesco DB Agriculture}
+  # --- real estate
+  - {ticker: VNQ, asset_class: real_estate, inception: "2004-09-23", name: Vanguard Real Estate}
+  - {ticker: IYR, asset_class: real_estate, inception: "2000-06-12", name: iShares US Real Estate}
+  # --- currency proxies
+  - {ticker: UUP, asset_class: currency, inception: "2007-02-20", name: Invesco DB US Dollar Bullish}
+  - {ticker: FXE, asset_class: currency, inception: "2005-12-09", name: Invesco CurrencyShares Euro}
+  - {ticker: FXY, asset_class: currency, inception: "2007-02-13", name: Invesco CurrencyShares Japanese Yen}
+  - {ticker: FXB, asset_class: currency, inception: "2006-06-21", name: Invesco CurrencyShares British Pound}
