@@ -1,0 +1,42 @@
+# Data layer settings (M1: FR-01, FR-02, NFR-09). Every value here is read by atu2/data/settings.py;
+# unknown keys are errors.
+download:
+  # First date requested from Alpaca.
+  start: "2016-01-01"
+  # sip = all US exchanges (free plan: history, not the latest 15 minutes); iex = one exchange.
+  feed: sip
+  # Switch to IEX if the account cannot use SIP. Each feed has its own cache folder: never mixed.
+  allow_iex_fallback: true
+  # Date range per request (years) and pause between requests (seconds; free plan 200/min).
+  chunk_years: 5
+  pause_seconds: 0.35
+  max_retries: 6
+  # Days re-fetched before the last cached date to detect rewritten history (splits, dividends).
+  overlap_days: 5
+  # Largest relative difference on the overlap that still counts as "unchanged".
+  rewrite_tolerance: 1.0e-6
+  # Today's bar counts as finished only after this New York time (after-hours trading ends at 20:00).
+  settle_time: "20:00"
+  # Cache root; bars go to <data_dir>/raw/<feed>/<TICKER>_1d.parquet.
+  data_dir: data
+
+validation:
+  # |daily return of adj_close| above this is flagged and fails until approved below.
+  max_abs_daily_return: 0.25
+  # More consecutive zero-volume days than this fail.
+  max_zero_volume_run: 2
+  # More consecutive missing NYSE trading days than this fail (1 day may be forward-filled).
+  max_consecutive_missing_days: 1
+  # Human decisions on flagged moves: {ticker, date, reason}. Empty until a real run flags one.
+  approved_moves: []
+
+cross_check:
+  # Second free source (Stooq daily CSV) compared on daily returns, not price levels, so a
+  # different adjustment base does not matter.
+  enabled: true
+  source: stooq
+  # A day disagrees when |return difference| is above this (fraction).
+  return_tolerance: 0.005
+  # Fail when more than this share of overlapping days disagree.
+  max_mismatch_share: 0.02
+  min_overlap_days: 200
