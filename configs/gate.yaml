@@ -1,0 +1,28 @@
+# Gate B thresholds (docs/BUILD_PLAN.md, "Gates and stop rules"; ADR 0008).
+# FROZEN: never edit this file to make a result pass. Any change needs a new ADR,
+# resets the trial count, and is not allowed after the holdout has been opened.
+# Its content hash is recorded in configs/gate.sha256 and checked by the tests.
+version: 1
+
+# Assumed cost, basis points per unit of turnover (central case until paper trading
+# measures real slippage).
+central_cost_bps: 2.0
+
+# Holdout net Sharpe (annualised) at the central cost must be strictly above this.
+min_net_sharpe_at_central_cost: 0.0
+
+# Deflated Sharpe probability (trial count from the registry) must be at least this.
+min_deflated_sharpe_probability: 0.95
+
+# Break-even cost must be at least this multiple of central_cost_bps.
+min_breakeven_cost_multiple: 2.0
+
+# Placebo (shuffled / random-direction signal) p-value must be above this, i.e. the
+# placebo shows no skill.
+min_placebo_p_value: 0.10
+
+# Neighbouring settings must keep at least this share of the chosen setting's Sharpe.
+min_neighbour_sharpe_retention: 0.5
+
+# Every report shows results at these cost levels.
+reported_cost_levels_bps: [0.0, 1.0, 2.0, 3.0, 5.0]
